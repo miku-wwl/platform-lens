@@ -1,4 +1,4 @@
-# PlatformLens — Detailed Design v0.8.4 GO IMPLEMENTATION ROADMAP FREEZE
+# PlatformLens — Detailed Design v0.8.5 GO LOCALSTACK-HEAVY ROADMAP FREEZE
 
 ## 1. Overview
 
@@ -99,6 +99,42 @@ lease_owner
 +
 conditional mutation
 ```
+
+
+### 2.6 Local-First Cloud Verification
+
+PlatformLens 把 LocalStack Ultimate 作为 V1 主要云端验证环境。
+
+```text
+Stage 1
+→ prove application/cloud contracts locally as far as practical
+
+Stage 2
+→ validate only the remaining real-AWS differences
+```
+
+LocalStack 负责尽可能验证：
+
+```text
+DynamoDB conditional writes
+S3 artifact semantics
+IAM least privilege
+AWS SDK credential/retry configuration
+multi-worker behavior
+transient service failures
+network latency
+crash/reclaim/replay
+```
+
+但不得把 LocalStack 结果表述成：
+
+```text
+proof of real DynamoDB GSI timing
+proof of real AWS quota behavior
+proof of real regional failure behavior
+```
+
+这些现实差异只在薄 Stage 2 做 smoke validation。
 
 ---
 
@@ -722,22 +758,74 @@ lease_expires_at = NULL
 
 ## 22. Heartbeat and Cancellation
 
-Heartbeat 独立运行。
+Heartbeat 独立 goroutine 运行，不能被：
 
-Renew 明确因：
+```text
+Git
+Terraform
+validators
+AI
+S3 writes
+```
+
+阻塞。
+
+Heartbeat error 必须分类：
+
+### 22.1 Authoritative Fencing Loss
+
+例如：
 
 ```text
 attempt_no mismatch
 lease_owner mismatch
+expected lease expiry mismatch
+conditional ownership/state failure
 ```
 
-失败时：
+处理：
 
 ```text
-attempt_cancel_event = set
+immediate attempt cancellation
+→ terminate child processes
+→ stop local authoritative work
 ```
 
-CommandRunner 终止 process tree；LLM SDK 若支持则取消 request。
+### 22.2 Transient Cloud Failure
+
+例如：
+
+```text
+throttling
+HTTP 429
+HTTP 500 / 503
+temporary network error
+timeout
+```
+
+不能把第一次 transient error 直接等价成 fencing loss。
+
+处理原则：
+
+```text
+AWS SDK bounded retry
+→ heartbeat loop retains last confirmed expiry
+→ retry within bounded safety window
+→ if renewal cannot be confirmed before safety deadline:
+     cancel local attempt
+     do not commit authoritative result
+     allow lease expiry + reclaim
+```
+
+不得在 lease ownership 不确定时写：
+
+```text
+COMPLETED
+```
+
+LLM / validator / artifact operations 同样继承 attempt context。
+
+CommandRunner 在 cancellation 后终止 process tree。
 
 ---
 
@@ -1771,6 +1859,366 @@ Conditional-check failure 必须映射为 domain-level ownership/CAS failure，�
 
 ---
 
+## 57.1 Shared AWS Runtime Contract
+
+LocalStack Stage 1 与 Real AWS Stage 2 必须使用 **同一套 AWS SDK for Go v2 client implementation**。
+
+Backend selection 与 endpoint override 必须分离：
+
+```text
+backend_mode = local | aws
+
+local
+→ SQLite + Filesystem
+
+aws + endpoint override
+→ DynamoDB + S3 through LocalStack
+
+aws + empty endpoint override
+→ DynamoDB + S3 through real AWS
+```
+
+禁止继续使用：
+
+```text
+endpoint != "" → choose AWS backend
+endpoint == "" → choose local backend
+```
+
+因为真实 AWS 正常情况下不需要 custom endpoint。
+
+共享 AWS 配置至少包含：
+
+```text
+region
+optional endpoint override
+default credential chain
+retry mode
+max attempts
+request timeout/context
+```
+
+禁止在 DynamoDB/S3 client 内硬编码：
+
+```text
+access_key = test
+secret_key = test
+```
+
+LocalStack 测试 credentials 由环境或 test harness 显式提供。
+
+建议集中到：
+
+```text
+internal/cloudaws/
+```
+
+或等价单一 factory，避免 DynamoDB/S3 各自维护不一致的 AWS config。
+
+Retry：
+
+```text
+standard bounded retry
+explicit max attempts
+```
+
+必须区分：
+
+```text
+ConditionalCheckFailed / authoritative CAS failure
+→ domain conditional error
+→ not treated as transient success
+
+throttling / 5xx / temporary transport
+→ retryable according to bounded AWS SDK policy
+```
+
+---
+
+## 57.2 Infrastructure Ownership
+
+V1 cloud infrastructure 由 Terraform 创建。
+
+Application runtime 默认 **不得隐式 provisioning**：
+
+```text
+no CreateTable during repository constructor
+no CreateBucket during storage constructor
+```
+
+Runtime startup 只允许：
+
+```text
+load config
+construct clients
+readiness check existing resources
+```
+
+`/readyz` 必须实际检查：
+
+```text
+RunRepository usable
+ArtifactStorage usable
+worker loop accepting work
+```
+
+DynamoDB readiness 可使用 `DescribeTable`；SQLite readiness 使用轻量 query。
+Readiness failure 不得触发资源创建。
+
+原因：
+
+```text
+least-privilege worker should not require infrastructure-admin permissions
+Stage 1 LocalStack and Stage 2 AWS use the same runtime permission boundary
+```
+
+Terraform ownership：
+
+```text
+infra/localstack/
+→ LocalStack DynamoDB / S3 / IAM test principal
+
+infra/aws/   # Stage 2 only
+→ ephemeral real-AWS resources
+```
+
+---
+
+## 57.3 S3 Artifact Storage Contract
+
+S3 storage 必须精确区分：
+
+```text
+NotFound
+AccessDenied
+throttling
+5xx/service failure
+transport failure
+```
+
+`Exists()` 不得把所有 error 都转换成：
+
+```text
+false, nil
+```
+
+Manifest commit：
+
+```text
+write manifest bytes
+→ S3 PutObject confirmed
+→ retain canonical returned artifact URI
+→ hash exact bytes
+→ conditional complete_run()
+```
+
+DynamoDB `manifest_uri` 必须保存 ArtifactStorage 返回的 canonical URI。
+
+S3 backend：
+
+```text
+s3://<bucket>/runs/<run_id>/attempts/<attempt_no>/manifest.json
+```
+
+如果 manifest PutObject 未确认成功：
+
+```text
+Run MUST NOT become COMPLETED
+```
+
+Orphan artifacts from losing/stale attempts 允许存在，但永远不 authoritative。
+
+---
+
+## 57.4 LocalStack Least-Privilege IAM Validation
+
+Stage 1 Ultimate acceptance 必须增加本地 IAM enforcement profile。
+
+Terraform 创建 dedicated PlatformLens worker principal。
+
+运行时 principal 只允许 V1 所需动作，例如：
+
+```text
+DynamoDB:
+DescribeTable
+GetItem
+PutItem
+UpdateItem
+Query
+
+S3:
+ListBucket          # readiness/head bucket when required
+GetObject
+PutObject
+Head/Get object semantics
+```
+
+资源范围必须收窄到：
+
+```text
+PlatformLens DynamoDB table + candidate index
+PlatformLens artifact bucket + runs/* prefix
+```
+
+Worker principal 不应拥有：
+
+```text
+dynamodb:CreateTable
+dynamodb:DeleteTable
+s3:CreateBucket
+s3:DeleteBucket
+iam:*
+administrator access
+```
+
+Acceptance 同时验证：
+
+```text
+required action → allowed
+admin/provisioning action → denied
+normal PlatformLens E2E still completes
+```
+
+可以使用 LocalStack IAM enforcement / principal policy simulation 作为测试机制。
+
+---
+
+## 57.5 LocalStack Cloud Fault / Retry Validation
+
+Stage 1 使用 LocalStack Ultimate 能力尽可能验证 AWS failure behavior。
+
+优先通过 LocalStack chaos/fault capability 注入：
+
+```text
+DynamoDB throttling
+DynamoDB 500/503
+S3 PutObject 500/503
+network latency
+temporary service outage
+```
+
+如果当前安装版本/entitlement 无法提供对应 chaos capability：
+
+```text
+do not fake LocalStack PASS
+→ retain AWS-SDK-level deterministic fault tests
+→ report LocalStack chaos sub-gate as BLOCKED
+```
+
+必须验证：
+
+```text
+bounded retries
+no state regression
+no lease regression
+CAS conflict is not retried as success
+no false COMPLETED
+manifest must exist before completion
+transient artifact failure leaves run non-completed or recoverable
+```
+
+Latency test 应证明：
+
+```text
+long S3/validator operation
+does not block independent heartbeat scheduling
+```
+
+DynamoDB outage test 应证明：
+
+```text
+renewal uncertainty
+→ bounded retry
+→ cancel before unsafe authority window
+→ later reclaim after service recovery
+```
+
+---
+
+## 57.6 Multi-Worker / Crash Acceptance
+
+Stage 1 不只做 goroutine-level concurrency。
+
+Ultimate acceptance 至少使用：
+
+```text
+2+ independent platformlens OS processes
+same LocalStack DynamoDB/S3
+unique worker IDs
+```
+
+验证：
+
+```text
+concurrent candidate discovery
+exactly-one claim
+heartbeat + phase updates
+stale worker fencing
+reclaim competition
+manifest authority
+```
+
+至少执行：
+
+```text
+20+ deterministic fixture Runs
+2+ worker processes
+```
+
+并包含一个真实 process kill 场景：
+
+```text
+worker A claims/pins
+→ worker A process is terminated
+→ lease expires
+→ worker B reclaims
+→ fresh workspace
+→ replay pinned commit
+→ winning_attempt increments
+→ COMPLETED
+```
+
+不得使用 symbolic ref re-resolution 替代 pinned replay。
+
+---
+
+## 57.7 Stage 1 Cloud Acceptance Evidence
+
+Stage 1 cloud acceptance 输出：
+
+```text
+STAGE1-LOCALSTACK-CLOUD-ACCEPTANCE-REPORT.md
+```
+
+至少记录：
+
+```text
+LocalStack version
+IAM enforcement status
+AWS SDK retry configuration
+worker principal
+allowed/denied IAM checks
+multi-worker run count
+crash/reclaim evidence
+fault-injection scenarios
+latency scenarios
+DynamoDB/S3 E2E
+manifest verification
+race detector result
+environment blockers
+```
+
+Stage 1 可以因环境 capability 缺失保持：
+
+```text
+PARTIAL — environment verification only
+```
+
+但实现错误不得降格为 environmental blocker。
+
+
+---
+
 ## 58. API
 
 V1 HTTP server 使用 Go `net/http`。
@@ -1885,45 +2333,97 @@ AI unavailable 不自动导致 Run FAILED。
 
 ## 61. CI / E2E Strategy
 
-Required CI E2E：
+Stage 1 acceptance 分成两个 gate。
 
-```text
-Git fixture
-→ source pin
-→ target discovery
-→ ValidationPlan
-→ deterministic adapters
-→ Evidence
-→ DeterministicFakeReviewer
-→ DeterministicFakeEvaluator
-→ LocalStack S3/DynamoDB
-→ manifest commit
-→ COMPLETED
-```
-
-Required CI 不调用真实 LLM。
-
-
-Go required checks：
+### 61.1 Fast Deterministic Gate
 
 ```text
 go fmt
 go vet ./...
 go test ./...
-go test -race ./...   # where supported by the CI platform
+go test -race ./...  # required where environment supports Go race detector
+
+Git fixtures
+SQLite
+validator adapter fixtures
+deterministic fake Reviewer/Evaluator
+manifest determinism
 ```
 
-项目可额外配置 staticcheck/golangci-lint，但不得把非必要 lint framework 变成架构依赖。
+Required tests 不调用真实 LLM。
 
-真实模型：
+### 61.2 LocalStack Ultimate Cloud Gate
 
 ```text
-optional live-AI smoke test
+Terraform provision LocalStack resources
+→ DynamoDB/S3 E2E
+→ field-scoped conditional lifecycle tests
+→ least-privilege IAM enforcement
+→ multi-process workers
+→ process-kill reclaim/replay
+→ cloud fault/latency scenarios
+→ S3 manifest read-back/hash verification
 ```
 
-不作为 merge/release gate。
+LocalStack gate 使用和 Stage 2 相同的：
 
-LocalStack E2E 验证 AWS API contract，不用于证明真实 DynamoDB GSI timing。
+```text
+AWS SDK implementation
+RunRepository implementation
+ArtifactStorage implementation
+```
+
+只改变：
+
+```text
+endpoint
+credentials
+test environment
+```
+
+### 61.3 Live Validators
+
+Stage 1 acceptance 需要真实：
+
+```text
+TFLint
+Kubeconform
+```
+
+fake executable 仅作为 adapter unit test，不能代替 live acceptance。
+
+### 61.4 Live AI
+
+真实模型只作为：
+
+```text
+optional smoke test
+```
+
+不作为 merge / release / Stage 1 gate。
+
+### 61.5 Claims Boundary
+
+LocalStack E2E 可以证明：
+
+```text
+application AWS API contract
+IAM policy intent
+failure-handling design
+retry behavior
+concurrency/recovery logic
+```
+
+不得宣称证明：
+
+```text
+real DynamoDB GSI propagation timing
+real AWS regional outage behavior
+real quotas
+real service latency distribution
+```
+
+这些在 Stage 2 只做最小 smoke validation。
 
 ---
 
@@ -1942,11 +2442,14 @@ no source lockfile
 → provenance PARTIAL
 ```
 
-### Terraform version
+### Terraform version / module API
 
 ```text
 Terraform < 1.10
 → toolchain validation fails
+
+terraform modules -json
+→ authoritative module metadata
 ```
 
 ### Module tree hash
@@ -1957,12 +2460,19 @@ different mtimes/absolute paths
 → same hash
 ```
 
-### Manifest canonical bytes
+### Manifest canonical bytes / storage
 
 ```text
 same logical manifest
 same canonical ordering
 → same manifest hash
+
+S3 manifest PutObject failure
+→ Run not COMPLETED
+
+successful S3 manifest write
+→ manifest_uri uses canonical returned URI
+→ read-back bytes hash matches
 ```
 
 ### Terminal lease cleanup
@@ -1979,7 +2489,46 @@ context cancellation propagates
 heartbeat goroutine terminates
 no goroutine leak after completed/failed Run
 process-tree cancellation works on target OS
-go test -race passes where supported
+go test -race passes for Stage 1 freeze
+```
+
+### AWS client contract
+
+```text
+no hard-coded LocalStack credentials inside production clients
+runtime does not CreateTable/CreateBucket
+shared retry configuration
+CAS failure classified as authoritative conditional error
+S3 NotFound separated from AccessDenied/service error
+```
+
+### LocalStack IAM
+
+```text
+required worker actions allowed
+CreateTable/CreateBucket/admin actions denied
+normal E2E succeeds under enforcement
+```
+
+### LocalStack resilience
+
+```text
+DynamoDB throttling / 5xx
+S3 PutObject 5xx
+network latency
+renewal transient failure
+bounded retry
+no false completion
+eventual reclaim
+```
+
+### Multi-process worker
+
+```text
+2+ processes
+20+ runs
+no double authoritative completion
+one real process-kill reclaim/replay
 ```
 
 ### Existing suites
@@ -1993,16 +2542,16 @@ per-target Terraform provenance
 Evaluator precedence
 toolchain/Clock/limits/API
 fake-AI LocalStack E2E
+live TFLint/Kubeconform
 ```
 
 ---
 
 ## 63. Scope Freeze
 
-The following architecture and product scope remain frozen across Stage 1, Stage 2 and Stage 3.
+v0.8.5 不改变 PlatformLens 产品目标；只把更多 **cloud verification responsibility** 从 Stage 2 前移到 Stage 1。
 
-
-V1 包含：
+V1 / Stage 1 包含：
 
 ```text
 isolated Git runtime
@@ -2017,6 +2566,7 @@ replay/cancellation
 
 Terraform/Kubernetes discovery
 producer adapters
+live TFLint/Kubeconform
 resource-level Kubeconform
 per-target provider/module provenance
 
@@ -2037,9 +2587,22 @@ health/readiness/version
 
 SQLite/DynamoDB
 Filesystem/S3
-LocalStack + fake-AI E2E
+shared AWS SDK config
+Terraform-owned LocalStack infrastructure
+LocalStack least-privilege IAM validation
+LocalStack fault/latency acceptance
+multi-process worker acceptance
+fake-AI E2E
 manifest commit
 ```
+
+LocalStack chaos / IAM test machinery 是：
+
+```text
+test/acceptance infrastructure
+```
+
+不是新的 PlatformLens product workflow。
 
 明确不包含：
 
@@ -2066,20 +2629,27 @@ Vector DB
 multi-cloud
 hostile-repository sandbox
 LangGraph
+
+real-AWS load testing
+real-AWS chaos campaign
+always-on AWS compute
+production autoscaling platform
 ```
 
 ---
 
 ## 64. Three-Stage Delivery Strategy
 
-PlatformLens 的架构与核心 invariants 在三个阶段中保持不变。
+PlatformLens 的核心架构在三个阶段保持不变，但 v0.8.5 将 Stage 1 做厚、Stage 2 压薄。
 
 ```text
 Stage 1
-LocalStack Ultimate / Local-First Completion
+Thick LocalStack Ultimate
+Build + Prove + Cloud Resilience
         ↓
 Stage 2
-Real AWS Validation
+Thin Real AWS Smoke
+Reality Check Only
         ↓
 Stage 3
 Reference-Driven Code Polish
@@ -2089,182 +2659,345 @@ Reference-Driven Code Polish
 
 ---
 
-### 64.1 Stage 1 — LocalStack Ultimate / Local-First Completion
+### 64.0 Current Implementation Baseline — 2026-09-19
 
-目标：
-
-> **在不上真实 AWS 的前提下，尽可能完成 PlatformLens 的全部核心功能、状态机、验证链路与 AWS-compatible backend。**
-
-#### Stage 1A — Foundation
+当前代码已完成：
 
 ```text
-go.mod / go.sum
-cmd/platformlens
-internal package skeleton
-typed models
-Clock interface / FakeClock
-config
-toolchain.lock
-log/slog
-net/http health/readiness/version
-CommandRunner
-context cancellation
-limits
+Go core implementation
+Git pin/replay
+SQLite/DynamoDB CAS
+Filesystem/S3
+Terraform/TFLint/Kubeconform
+Evidence/AI/Manifest
+LocalStack DynamoDB/S3 E2E
+LocalStack lifecycle concurrency
+live TFLint
+live Kubeconform
 ```
 
-#### Stage 1B — Git Source
+当前 acceptance：
 
 ```text
-isolated Git runtime
-ref contract
-repo lock
-fetch/resolve/verify
-pin-once CAS
-workspace lifecycle
-path confinement
+go vet ./...           PASS
+go test ./...          PASS
+TFLint live            PASS
+Kubeconform live       PASS
+SQLite E2E             PASS
+LocalStack E2E         PASS
+LocalStack CAS         PASS
+go test -race ./...    BLOCKED by local CGO/C compiler environment
 ```
 
-#### Stage 1C — Run Lifecycle
-
-```text
-RunRepository CAS
-claim/renew/reclaim
-expected lease expiry
-heartbeat
-fencing
-cancellation
-terminal lease cleanup
-SQLite concurrency
-```
-
-#### Stage 1D — Deterministic Analysis
-
-```text
-target discovery
-ValidationPlan
-Terraform adapters
-TFLint adapter
-resource-level Kubeconform
-per-target provider/module provenance
-canonical module tree hash
-Diagnostics
-Evidence
-result rules
-```
-
-#### Stage 1E — AI Layer
-
-```text
-Reviewer
-Deterministic Evaluator
-Semantic Evaluator
-degraded mode
-conditional AI artifacts
-template report
-canonical manifest
-```
-
-Required CI 使用：
-
-```text
-DeterministicFakeReviewer
-DeterministicFakeEvaluator
-```
-
-真实模型只做 optional smoke test。
-
-#### Stage 1F — LocalStack AWS-Compatible Backend
-
-```text
-AWS SDK for Go v2
-DynamoDB RunRepository
-S3 ArtifactStorage
-shared LocalStack/Real-AWS client configuration
-Terraform LocalStack infrastructure
-conditional-write contract tests
-orphan artifact tests
-stale-candidate tests
-```
-
-#### Stage 1G — Local Failure / E2E Verification
-
-```text
-Git race tests
-claim/reclaim race
-lease expiry race
-process cancellation
-crash/replay
-SQLite/DynamoDB contract parity
-LocalStack E2E
-manifest verification
-sample report
-```
-
-Stage 1 completion criteria：
-
-```text
-core product behavior complete
-all frozen invariants tested
-LocalStack E2E repeatable
-no real AWS required for normal development
-```
+v0.8.5 后续工作不重新实现 Stage 1A–1G，而是增加 cloud-runtime hardening 与 Ultimate acceptance。
 
 ---
 
-### 64.2 Stage 2 — Real AWS Validation
+### 64.1 Stage 1 — Thick LocalStack Ultimate / Local-First
 
-Stage 2 不重新设计或重写 PlatformLens。
+目标：
 
-必须保持：
+> **不上真实 AWS，也尽可能把 PlatformLens 的产品逻辑、AWS-compatible contract、least-privilege、failure handling、multi-worker recovery 全部验证完成。**
+
+#### Stage 1A–1G — Existing Core
+
+继续保持：
 
 ```text
-same application code
-same RunRepository abstraction
-same ArtifactStorage abstraction
-same manifest/evidence schemas
-same validation pipeline
-same fencing/replay semantics
+Foundation
+Git Source
+Run Lifecycle
+Deterministic Analysis
+AI Layer
+DynamoDB/S3 LocalStack Backend
+Local Failure/E2E
 ```
 
-主要变化：
+这些部分只有 regression，不重新设计。
+
+#### Stage 1H — AWS Runtime Contract Hardening
+
+实现：
 
 ```text
-LocalStack endpoints
-→ real AWS endpoints
+explicit backend mode independent from endpoint override
+shared AWS SDK for Go v2 configuration
+no hard-coded test credentials in production clients
+explicit bounded retry policy
+precise AWS error classification
+Terraform-only cloud provisioning
+side-effect-free runtime client construction/readiness
+repository + artifact + worker readiness
+canonical S3 manifest URI
+S3 read-back/hash verification
 ```
 
-重点验证：
+特别修复当前代码边界：
 
 ```text
-real DynamoDB conditional writes
-real GSI behavior
-real S3 behavior
-IAM least privilege
-AWS credential chain
-TLS/network behavior
-service throttling
-timeouts/retries
-real AWS error responses
-deployment/restart behavior
-CloudWatch logs/metrics
-operational cost
+AWSEndpointURL must not be the backend selector
+Dynamo/S3 constructors must not auto-create resources
+LocalStack endpoint must not imply hard-coded root/test credentials
+S3 Exists must not swallow AccessDenied/5xx as "not found"
+/readyz must include repository + artifacts + worker acceptance
 ```
 
-Stage 2 建议交付：
+Heartbeat：
 
 ```text
-real-AWS Terraform stack
-IAM policy evidence
-real DynamoDB/S3 contract test report
-restart/reclaim test
-CloudWatch screenshots/metrics
-cost notes
-production-style validation report
+CAS/fencing failure → immediate cancel
+transient cloud failure → bounded retry within lease safety window
+renewal cannot be confirmed safely → cancel local authority, allow reclaim
+```
+
+#### Stage 1I — LocalStack IAM / Resilience / Multi-Worker Acceptance
+
+IAM：
+
+```text
+LocalStack IAM enforcement
+dedicated worker principal
+least-privilege policy
+positive permission tests
+negative admin/provisioning tests
+full PlatformLens E2E under restricted credentials
+```
+
+Fault / latency：
+
+```text
+DynamoDB throttling
+DynamoDB 500/503
+S3 PutObject 500/503
+network latency
+temporary outage
+```
+
+验证：
+
+```text
+bounded retry
+heartbeat independence
+no state/lease regression
+no false COMPLETED
+eventual reclaim after outage
+manifest authority
+```
+
+Multi-worker：
+
+```text
+2+ independent OS processes
+20+ fixture Runs
+same LocalStack DynamoDB/S3
+unique worker IDs
+exactly-one authoritative winner
+```
+
+Crash scenario：
+
+```text
+worker A claim/pin
+→ kill worker A process
+→ lease expires
+→ worker B reclaim
+→ replay pinned commit
+→ winning_attempt increments
+→ manifest from winner
+→ COMPLETED
+```
+
+#### Stage 1J — Final Local Freeze Gate
+
+必须重新执行：
+
+```text
+go fmt ./...
+go vet ./...
+go test ./...
+go test -race ./...
+
+live TFLint
+live Kubeconform
+
+SQLite E2E
+LocalStack DynamoDB/S3 E2E
+LocalStack IAM E2E
+LocalStack fault/latency suite
+multi-process suite
+real process-kill reclaim/replay
+manifest read-back verification
+```
+
+Stage 1 完成条件：
+
+```text
+core contracts PASS
+race detector PASS
+live validators PASS
+LocalStack cloud gate PASS
+no real AWS required
+```
+
+如果仅因外部环境无法执行某个 required gate：
+
+```text
+PARTIAL — environment verification only
+```
+
+如果存在代码 correctness failure：
+
+```text
+FAIL / PARTIAL — implementation
+```
+
+不得混淆两者。
+
+---
+
+### 64.2 Stage 2 — Thin Real AWS Smoke Validation
+
+Stage 2 是 **短生命周期 reality check**，不是开发阶段。
+
+保持：
+
+```text
+same Go binary
+same AWS SDK client implementation
+same DynamoDB repository
+same S3 storage
+same IAM policy intent
+same state machine
+same evidence/manifest schemas
+```
+
+默认执行方式：
+
+```text
+local PlatformLens worker(s)
+→ real AWS public endpoints
+```
+
+因此不要求购买或长期运行：
+
+```text
+EC2
+ECS
+EKS
+always-on compute
+```
+
+#### AWS-01 Ephemeral Provisioning
+
+Terraform 创建：
+
+```text
+DynamoDB table + GSI
+S3 artifact bucket
+least-privilege IAM principal/role
+```
+
+资源使用唯一 test prefix/name。
+
+#### AWS-02 Happy Path
+
+只跑少量确定性 fixture：
+
+```text
+submit
+→ claim
+→ pin
+→ validate
+→ manifest to real S3
+→ COMPLETED
+```
+
+验证：
+
+```text
+real TLS/network
+real credential chain
+real DynamoDB conditional write
+real S3 read-back/hash
+```
+
+#### AWS-03 Recovery Smoke
+
+启动两个本地 worker 连接真实 AWS：
+
+```text
+worker A claim/pin
+→ kill A
+→ lease expiry
+→ worker B reclaim
+→ replay pinned commit
+→ COMPLETED
+```
+
+只需要 1 个 recovery case，不在 AWS 做大规模 chaos/load。
+
+#### AWS-04 IAM Smoke
+
+验证：
+
+```text
+required worker actions allowed
+CreateTable/CreateBucket/admin action denied
+```
+
+Stage 1 已完成完整 IAM matrix；这里仅确认 real AWS 行为。
+
+#### AWS-05 GSI / Cost / Cleanup
+
+验证：
+
+```text
+GSI candidate discovery works
+base-table CAS remains authority
+```
+
+不测量或宣称固定 GSI propagation SLA。
+
+记录：
+
+```text
+resource list
+test duration
+approximate cost
+```
+
+同一验证 session：
+
+```text
+terraform destroy
+```
+
+Stage 2 明确不做：
+
+```text
+new product code
+large benchmark
+real-AWS chaos campaign
+long soak test
+EKS/ECS platform build
+production autoscaling
+architecture redesign
+```
+
+Stage 2 completion criteria：
+
+```text
+provision PASS
+happy path PASS
+one recovery PASS
+IAM allow/deny PASS
+GSI/S3 smoke PASS
+destroy PASS
 ```
 
 原则：
 
-> **Stage 2 验证真实云语义，不扩产品功能。**
+> **Stage 1 proves most behavior; Stage 2 only proves that the same behavior survives contact with real AWS.**
 
 ---
 
@@ -2273,9 +3006,9 @@ production-style validation report
 Stage 3 只能在：
 
 ```text
-Stage 1 functional completion
+Stage 1 local cloud freeze
 +
-Stage 2 real-AWS validation
+Stage 2 real-AWS smoke validation
 ```
 
 之后进行。
@@ -2370,11 +3103,12 @@ Stage 3 completion criteria：
 
 ```text
 all existing tests still pass
-LocalStack E2E still passes
-real-AWS smoke/contract tests still pass
+LocalStack thick acceptance still passes
+real-AWS thin smoke still passes
 no scope growth
 no invariant regression
 ```
+
 
 ---
 
@@ -2389,6 +3123,10 @@ no invariant regression
 > **7. Terraform provider/module provenance is recorded per target.**  
 > **8. Module content hashes and manifest hashes use versioned canonical algorithms.**  
 > **9. Deterministic evidence validation always precedes semantic evaluation.**  
-> **10. Required CI E2E remains deterministic and does not depend on a live LLM.**
+> **10. Required CI E2E remains deterministic and does not depend on a live LLM.**  
+> **11. Runtime AWS clients do not implicitly provision DynamoDB/S3 infrastructure.**  
+> **12. LocalStack and Real AWS use the same AWS SDK implementations; endpoint/credentials are configuration only.**  
+> **13. A Run cannot become COMPLETED until the authoritative manifest write is confirmed and its exact bytes are hashed.**  
+> **14. Transient cloud failures are distinguished from authoritative fencing loss and cannot silently produce false completion.**
 
-> **No further architecture work is required before Go implementation.**
+> **No further architecture redesign is required before the Stage 1 LocalStack-heavy implementation pass.**

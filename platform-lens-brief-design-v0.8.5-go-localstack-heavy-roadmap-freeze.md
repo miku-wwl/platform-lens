@@ -1,4 +1,4 @@
-# PlatformLens — Brief Design v0.8.4 GO IMPLEMENTATION ROADMAP FREEZE
+# PlatformLens — Brief Design v0.8.5 GO LOCALSTACK-HEAVY ROADMAP FREEZE
 
 ## 1. 项目定位
 
@@ -66,6 +66,22 @@ AWS SDK for Go v2
 ```
 
 Git / Terraform / TFLint / Kubeconform 继续作为外部 CLI，由统一 `CommandRunner` 调用。
+
+## 1.2 Delivery Boundary
+
+v0.8.5 不改变 PlatformLens 核心架构，只重新划分 Stage 1 / Stage 2 责任：
+
+```text
+Stage 1 = thick LocalStack stage
+         build + cloud-contract + resilience + IAM validation
+
+Stage 2 = thin real-AWS stage
+         short-lived smoke validation only
+```
+
+目标：
+
+> **尽量在 LocalStack Ultimate 发现并修复云端逻辑问题，把真实 AWS 只留给不可替代的现实差异验证。**
 
 ---
 
@@ -280,74 +296,137 @@ health/readiness/version
 workspace sweeper
 ```
 
-Required CI E2E：
+Stage 1 acceptance 分两层：
 
 ```text
-LocalStack
-+
-deterministic fake reviewer/evaluator
+Fast deterministic gate
+→ go fmt / vet / test / race
+→ SQLite + fake-AI
+→ validator fixtures
+
+LocalStack Ultimate cloud gate
+→ DynamoDB / S3
+→ multi-worker CAS
+→ crash / reclaim / replay
+→ least-privilege IAM enforcement
+→ bounded retry / fault / latency tests
+→ authoritative manifest verification
 ```
 
 真实 LLM 只作为 optional smoke test。
+
+真实 AWS 不属于 Stage 1。
+
 
 ---
 
 
 ## 10. Three-Stage Delivery Strategy
 
-### Stage 1 — LocalStack Ultimate / Local-First Completion
+### Stage 1 — Thick LocalStack Ultimate / Local-First
 
 目标：
 
 ```text
-尽可能完成完整 PlatformLens
+绝大多数开发
++
+绝大多数 AWS-compatible contract verification
++
+并发 / recovery / IAM / fault injection
 ```
 
-包括：
+Stage 1A–1G 保留现有核心实现，并新增：
 
 ```text
-Milestone 0–6 core implementation
-SQLite / Filesystem
-DynamoDB / S3 through LocalStack Ultimate
-failure injection
-concurrency tests
-fake-AI deterministic CI E2E
-optional live-AI smoke
+Stage 1H — AWS Runtime Contract Hardening
+- explicit backend mode independent from endpoint override
+- Terraform owns infrastructure
+- no hard-coded LocalStack credentials inside clients
+- shared AWS SDK configuration
+- bounded standard retries
+- precise AWS error classification
+- repository/artifact/worker readiness
+- canonical S3 manifest URI
+
+Stage 1I — LocalStack Cloud Resilience
+- least-privilege IAM enforcement
+- IAM allow/deny verification
+- DynamoDB throttling / 5xx fault tests
+- S3 write failure tests
+- network latency tests
+- heartbeat under transient cloud faults
+- multi-process workers
+- real process kill → reclaim → pinned replay
+- concurrent batch acceptance
 ```
 
 原则：
 
-> **Stage 1 不是 demo；它应完成绝大多数产品逻辑。**
+> **Stage 1 不是 demo，而是主要的 correctness + cloud-behavior verification stage。**
 
-### Stage 2 — Real AWS Validation
+Stage 1 freeze 需要：
+
+```text
+go test -race PASS
+TFLint live PASS
+Kubeconform live PASS
+LocalStack E2E PASS
+LocalStack IAM PASS
+LocalStack resilience/fault tests PASS
+multi-worker crash/recovery PASS
+```
+
+环境无法执行的 required gate 必须明确标记 `PARTIAL — environment verification only`，不能伪装 PASS。
+
+### Stage 2 — Thin Real AWS Smoke Validation
+
+Stage 2 不重新开发 PlatformLens。
 
 保持：
 
 ```text
-same architecture
+same Go binary
+same AWS SDK implementation
 same RunRepository contract
 same ArtifactStorage contract
-same application code
+same state machine
+same manifest/evidence schemas
 ```
 
-重点验证：
+只验证 LocalStack 无法最终证明的现实差异：
 
 ```text
-real DynamoDB conditional writes
-real S3
-IAM least privilege
-deployment/restart behavior
-network/TLS
-throttling/service errors
-CloudWatch observability
+real AWS credential chain / TLS
+real DynamoDB conditional-write behavior
+real GSI candidate discovery smoke
+real S3 artifact read/write
+real IAM allow + deny
+one happy-path Run
+one crash/reclaim/replay Run
 cost evidence
+terraform destroy
 ```
 
-Stage 2 不新增产品功能，只验证真实 AWS semantics。
+默认不要求：
+
+```text
+EC2 / ECS / EKS deployment
+long-running infrastructure
+load testing
+chaos testing
+large-scale benchmarks
+new product features
+```
+
+可以直接让本地 PlatformLens worker 连接短生命周期真实 DynamoDB/S3/IAM，从而把 AWS 成本压到最低。
+
+原则：
+
+> **Stage 2 是短生命周期的 reality check，不是第二次开发。**
 
 ### Stage 3 — Reference-Driven Code Polish
 
-在功能与 AWS 行为稳定后，对照四个参考仓：
+在 Stage 1 + Stage 2 行为稳定后，对照四个参考仓：
 
 ```text
 ANZ golden-retriever
@@ -382,7 +461,8 @@ do not mechanically copy source
 
 Stage 3 的目标是：
 
-> **让已经正确运行的 PlatformLens 更像成熟工程代码，而不是增加功能。**
+> **让已经被 LocalStack + Real AWS 验证过的 PlatformLens 更像成熟工程代码，而不是增加功能。**
+
 
 ---
 
@@ -405,6 +485,8 @@ RAG
 multi-cloud
 hostile-repository sandbox
 LangGraph
+real-AWS load/chaos stage
+always-on AWS compute
 ```
 
-> **This Go implementation design is frozen for implementation.**
+> **This v0.8.5 Go / LocalStack-heavy delivery boundary is frozen for implementation.**
