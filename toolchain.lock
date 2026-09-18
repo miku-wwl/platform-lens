@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "go": {"version": "1.24.2"},
+  "terraform": {"version": "1.14.0"},
+  "tflint": {"version": "0.55.1"},
+  "kubeconform": {
+    "version": "0.6.7",
+    "kubernetes_version": "1.30.0",
+    "schema_repository": "https://github.com/yannh/kubernetes-json-schema",
+    "schema_repository_commit": "v1.30.0",
+    "schema_location_template": "default"
+  }
+}

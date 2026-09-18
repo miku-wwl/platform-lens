@@ -1,0 +1,7 @@
+.platformlens/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.exe
+*.test
+coverage.out
