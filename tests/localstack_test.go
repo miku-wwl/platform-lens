@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/miku-wwl/platform-lens/internal/app"
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/domain"
 	"github.com/miku-wwl/platform-lens/internal/evaluation"
 	"github.com/miku-wwl/platform-lens/internal/execution"
@@ -23,6 +24,9 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set PLATFORMLENS_LOCALSTACK_ENDPOINT to run LocalStack E2E")
 	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
 	fixture := t.TempDir()
 	git(t, fixture, "init", "-b", "main")
 	git(t, fixture, "config", "user.email", "platformlens@example.invalid")
@@ -41,6 +45,7 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 	config.SourceCacheDir = filepath.Join(config.DataDir, "cache")
 	config.ToolchainPath = filepath.Join(repositoryRoot(t), "toolchain.lock")
 	config.AWSEndpointURL = endpoint
+	config.BackendMode = runtime.BackendAWS
 	config.DynamoTable = "platformlens-runs"
 	config.S3Bucket = "platformlens-artifacts"
 	if err := config.Prepare(); err != nil {
@@ -51,11 +56,15 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := execution.NewCommandRunner()
-	repository, err := runs.NewDynamoRepository(context.Background(), endpoint, config.AWSRegion, config.DynamoTable, config.DynamoGSI, runtime.RealClock{})
+	awsConfig, err := cloudaws.Load(context.Background(), cloudaws.Options{Region: config.AWSRegion, Endpoint: endpoint, MaxAttempts: config.AWSMaxAttempts})
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifacts, err := storage.NewS3(context.Background(), endpoint, config.AWSRegion, config.S3Bucket)
+	repository, err := runs.NewDynamoRepository(context.Background(), awsConfig, config.DynamoTable, config.DynamoGSI, runtime.RealClock{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := storage.NewS3(awsConfig, config.S3Bucket)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,11 +84,17 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 	if completed.State != domain.StateCompleted || completed.WinningAttempt == nil || completed.ManifestURI == "" || completed.ManifestHash == "" || completed.LeaseOwner != "" {
 		t.Fatalf("LocalStack completion invariant failed: %+v", completed)
 	}
+	if want := "s3://" + config.S3Bucket + "/runs/" + completed.RunID + "/attempts/1/manifest.json"; completed.ManifestURI != want {
+		t.Fatalf("manifest URI=%q, want canonical %q", completed.ManifestURI, want)
+	}
 	manifest, err := artifacts.Get(context.Background(), completed.ManifestURI)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(manifest) == 0 {
 		t.Fatal("S3 manifest is empty")
+	}
+	if got := storage.Hash(manifest); got != completed.ManifestHash {
+		t.Fatalf("manifest hash=%q, completed hash=%q", got, completed.ManifestHash)
 	}
 }

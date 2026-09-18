@@ -10,6 +10,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/domain"
 	"github.com/miku-wwl/platform-lens/internal/runs"
 	"github.com/miku-wwl/platform-lens/internal/runtime"
@@ -20,15 +22,46 @@ func TestLocalStackDynamoAtomicLifecycleCAS(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set PLATFORMLENS_LOCALSTACK_ENDPOINT to run DynamoDB concurrency acceptance")
 	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
 	ctx := context.Background()
 	clock := runtime.NewFakeClock(time.Date(2026, 9, 19, 0, 0, 0, 0, time.UTC))
 	table := "platformlens-runs-hardening-" + runtime.NewID()[:8]
-	repoA, err := runs.NewDynamoRepository(ctx, endpoint, "us-east-1", table, "candidate-index", clock)
+	awsConfig, err := cloudaws.Load(ctx, cloudaws.Options{Region: "us-east-1", Endpoint: endpoint, MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	repoA, err := runs.NewDynamoRepository(ctx, awsConfig, table, "candidate-index", clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = repoA.Client.CreateTable(ctx, &dynamodb.CreateTableInput{
+		TableName:   aws.String(table),
+		BillingMode: types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{
+			{AttributeName: aws.String("run_id"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("state"), AttributeType: types.ScalarAttributeTypeS},
+			{AttributeName: aws.String("lease_expires_at"), AttributeType: types.ScalarAttributeTypeS},
+		},
+		KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("run_id"), KeyType: types.KeyTypeHash}},
+		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
+			IndexName: aws.String("candidate-index"),
+			KeySchema: []types.KeySchemaElement{
+				{AttributeName: aws.String("state"), KeyType: types.KeyTypeHash},
+				{AttributeName: aws.String("lease_expires_at"), KeyType: types.KeyTypeRange},
+			},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll},
+		}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _, _ = repoA.Client.DeleteTable(ctx, &dynamodb.DeleteTableInput{TableName: aws.String(table)}) }()
-	repoB, err := runs.NewDynamoRepository(ctx, endpoint, "us-east-1", table, "candidate-index", clock)
+	if err := dynamodb.NewTableExistsWaiter(repoA.Client).Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)}, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	repoB, err := runs.NewDynamoRepository(ctx, awsConfig, table, "candidate-index", clock)
 	if err != nil {
 		t.Fatal(err)
 	}

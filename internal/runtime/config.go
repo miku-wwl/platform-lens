@@ -30,6 +30,7 @@ type Config struct {
 	SourceCacheDir         string `json:"source_cache_dir"`
 	ToolchainPath          string `json:"toolchain_path"`
 	WorkerID               string `json:"worker_id"`
+	BackendMode            string `json:"backend_mode"`
 	LeaseSeconds           int    `json:"lease_seconds"`
 	HeartbeatSeconds       int    `json:"heartbeat_seconds"`
 	AWSEndpointURL         string `json:"aws_endpoint_url,omitempty"`
@@ -40,18 +41,24 @@ type Config struct {
 	AllowLocalGit          bool   `json:"allow_local_git"`
 	AllowToolchainOverride bool   `json:"allow_toolchain_override"`
 	WorkerPollSeconds      int    `json:"worker_poll_seconds"`
+	AWSMaxAttempts         int    `json:"aws_max_attempts"`
 	Limits                 Limits `json:"limits"`
 }
+
+const (
+	BackendLocal = "local"
+	BackendAWS   = "aws"
+)
 
 func DefaultConfig() Config {
 	return Config{
 		ServiceName: "platformlens", Version: "0.1.0", DataDir: ".platformlens",
 		DatabasePath: ".platformlens/platformlens.sqlite3", ArtifactDir: ".platformlens/artifacts",
 		WorkspaceDir: ".platformlens/workspaces", SourceCacheDir: ".platformlens/source-cache",
-		ToolchainPath: "toolchain.lock", WorkerID: NewWorkerID(), LeaseSeconds: 60,
+		ToolchainPath: "toolchain.lock", WorkerID: NewWorkerID(), BackendMode: BackendLocal, LeaseSeconds: 60,
 		HeartbeatSeconds: 15, AWSRegion: "us-east-1", DynamoTable: "platformlens-runs",
 		DynamoGSI: "candidate-index", S3Bucket: "platformlens-artifacts", AllowLocalGit: false,
-		WorkerPollSeconds: 5,
+		WorkerPollSeconds: 5, AWSMaxAttempts: 3,
 		Limits: Limits{MaxRepoBytes: 512 * 1024 * 1024, MaxFiles: 50000, MaxTargets: 128,
 			MaxDiagnostics: 10000, MaxRawOutputBytes: 2 * 1024 * 1024, MaxSourceExcerptBytes: 32 * 1024,
 			MaxAgentContextBytes: 128 * 1024, MaxFindings: 1000, CommandTimeoutSeconds: 300},
@@ -67,10 +74,14 @@ func LoadConfig() Config {
 	setString(&c.SourceCacheDir, "PLATFORMLENS_SOURCE_CACHE_DIR")
 	setString(&c.ToolchainPath, "PLATFORMLENS_TOOLCHAIN_PATH")
 	setString(&c.WorkerID, "PLATFORMLENS_WORKER_ID")
+	setString(&c.BackendMode, "PLATFORMLENS_BACKEND")
 	setString(&c.AWSEndpointURL, "AWS_ENDPOINT_URL")
 	setString(&c.AWSRegion, "AWS_REGION")
 	setString(&c.DynamoTable, "PLATFORMLENS_DYNAMODB_TABLE")
 	setString(&c.S3Bucket, "PLATFORMLENS_S3_BUCKET")
+	if value := os.Getenv("PLATFORMLENS_AWS_MAX_ATTEMPTS"); value != "" {
+		c.AWSMaxAttempts = parseInt(value, c.AWSMaxAttempts)
+	}
 	if value := os.Getenv("PLATFORMLENS_ALLOW_LOCAL_GIT"); value != "" {
 		c.AllowLocalGit = parseBool(value, c.AllowLocalGit)
 	}
@@ -113,6 +124,15 @@ func (c Config) Prepare() error {
 }
 
 func (c Config) Validate() error {
+	if c.BackendMode != BackendLocal && c.BackendMode != BackendAWS {
+		return errors.New("backend_mode must be local or aws")
+	}
+	if c.BackendMode == BackendLocal && c.AWSEndpointURL != "" {
+		return errors.New("aws_endpoint_url requires backend_mode=aws")
+	}
+	if c.BackendMode == BackendAWS && c.AWSMaxAttempts <= 0 {
+		return errors.New("aws_max_attempts must be positive")
+	}
 	if c.LeaseSeconds <= 0 || c.HeartbeatSeconds <= 0 || c.WorkerPollSeconds <= 0 {
 		return errors.New("lease and heartbeat seconds must be positive")
 	}

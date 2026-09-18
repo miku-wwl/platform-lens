@@ -11,6 +11,7 @@ import (
 
 	"github.com/miku-wwl/platform-lens/internal/api"
 	"github.com/miku-wwl/platform-lens/internal/app"
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/evaluation"
 	"github.com/miku-wwl/platform-lens/internal/execution"
 	"github.com/miku-wwl/platform-lens/internal/review"
@@ -68,12 +69,16 @@ func newService(ctx context.Context, config runtime.Config, toolchain runtime.To
 	var repo runs.Repository
 	var artifacts storage.ArtifactStorage
 	var err error
-	if config.AWSEndpointURL != "" {
-		repo, err = runs.NewDynamoRepository(ctx, config.AWSEndpointURL, config.AWSRegion, config.DynamoTable, config.DynamoGSI, clock)
+	if config.BackendMode == runtime.BackendAWS {
+		awsConfig, loadErr := cloudaws.Load(ctx, cloudaws.Options{Region: config.AWSRegion, Endpoint: config.AWSEndpointURL, MaxAttempts: config.AWSMaxAttempts})
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		repo, err = runs.NewDynamoRepository(ctx, awsConfig, config.DynamoTable, config.DynamoGSI, clock)
 		if err != nil {
 			return nil, err
 		}
-		artifacts, err = storage.NewS3(ctx, config.AWSEndpointURL, config.AWSRegion, config.S3Bucket)
+		artifacts, err = storage.NewS3(awsConfig, config.S3Bucket)
 	} else {
 		repo, err = runs.OpenSQLite(config.DatabasePath, clock)
 		if err != nil {
@@ -100,6 +105,10 @@ func serve(service *app.Service, server api.Server) {
 		port = value
 	}
 	address := host + ":" + port
+	if err := service.CheckDependencies(context.Background()); err != nil {
+		service.Logger.Error("runtime dependencies are not ready", "error", err)
+		os.Exit(1)
+	}
 	service.Logger.Info("server starting", "address", address)
 	go service.WorkerLoop(context.Background())
 	if err := http.ListenAndServe(address, server.Handler()); err != nil {

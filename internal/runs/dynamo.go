@@ -9,10 +9,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/domain"
 	"github.com/miku-wwl/platform-lens/internal/runtime"
 )
@@ -24,41 +23,18 @@ type DynamoRepository struct {
 	Clock  runtime.Clock
 }
 
-func NewDynamoRepository(ctx context.Context, endpoint, region, table, gsi string, clock runtime.Clock) (*DynamoRepository, error) {
-	config, err := awsConfig(ctx, endpoint, region)
-	if err != nil {
-		return nil, err
-	}
-	client := dynamodb.NewFromConfig(config)
+func NewDynamoRepository(_ context.Context, config cloudaws.Config, table, gsi string, clock runtime.Clock) (*DynamoRepository, error) {
+	client := dynamodb.NewFromConfig(config.AWS)
 	repo := &DynamoRepository{Client: client, Table: table, GSI: gsi, Clock: clock}
 	if repo.Clock == nil {
 		repo.Clock = runtime.RealClock{}
 	}
-	if err := repo.EnsureTable(ctx); err != nil {
-		return nil, err
-	}
 	return repo, nil
 }
 
-func awsConfig(ctx context.Context, endpoint, region string) (aws.Config, error) {
-	options := []func(*awsconfig.LoadOptions) error{awsconfig.WithRegion(region)}
-	if endpoint != "" {
-		options = append(options, awsconfig.WithBaseEndpoint(endpoint), awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")))
-	}
-	return awsconfig.LoadDefaultConfig(ctx, options...)
-}
-
-func (r *DynamoRepository) EnsureTable(ctx context.Context) error {
+func (r *DynamoRepository) Ready(ctx context.Context) error {
 	_, err := r.Client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(r.Table)})
-	if err == nil {
-		return nil
-	}
-	_, err = r.Client.CreateTable(ctx, &dynamodb.CreateTableInput{TableName: aws.String(r.Table), BillingMode: types.BillingModePayPerRequest, KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("run_id"), KeyType: types.KeyTypeHash}}, AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("run_id"), AttributeType: types.ScalarAttributeTypeS}, {AttributeName: aws.String("state"), AttributeType: types.ScalarAttributeTypeS}, {AttributeName: aws.String("lease_expires_at"), AttributeType: types.ScalarAttributeTypeS}}, GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{IndexName: aws.String(r.GSI), KeySchema: []types.KeySchemaElement{{AttributeName: aws.String("state"), KeyType: types.KeyTypeHash}, {AttributeName: aws.String("lease_expires_at"), KeyType: types.KeyTypeRange}}, Projection: &types.Projection{ProjectionType: types.ProjectionTypeAll}}}})
-	if err != nil {
-		return err
-	}
-	waiter := dynamodb.NewTableExistsWaiter(r.Client)
-	return waiter.Wait(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(r.Table)}, 2*time.Minute)
+	return err
 }
 
 func (r *DynamoRepository) CreateRun(ctx context.Context, repositoryURL, requestedRef, requestedPath string) (domain.AnalysisRun, error) {
@@ -423,8 +399,7 @@ func mapConditional(err error) error {
 	if err == nil {
 		return nil
 	}
-	var conditional *types.ConditionalCheckFailedException
-	if errors.As(err, &conditional) {
+	if cloudaws.IsConditional(err) {
 		return ErrConditional
 	}
 	return fmt.Errorf("dynamodb: %w", err)

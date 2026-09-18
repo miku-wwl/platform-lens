@@ -15,6 +15,7 @@ var (
 )
 
 type Repository interface {
+	Ready(context.Context) error
 	CreateRun(context.Context, string, string, string) (domain.AnalysisRun, error)
 	FindQueuedCandidates(context.Context, int) ([]domain.AnalysisRun, error)
 	ClaimRun(context.Context, string, string, time.Duration) (domain.AnalysisRun, error)

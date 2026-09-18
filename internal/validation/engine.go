@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +64,9 @@ type Output struct {
 }
 
 func (e *Engine) Execute(ctx context.Context, workspace string, plan PlanOutput) (Output, error) {
+	if err := acceptanceOperationDelay(ctx); err != nil {
+		return Output{}, err
+	}
 	output := Output{}
 	for _, target := range plan.TerraformTargets {
 		root := filepath.Join(workspace, filepath.FromSlash(target.RootPath))
@@ -107,6 +111,28 @@ func (e *Engine) Execute(ctx context.Context, workspace string, plan PlanOutput)
 		output.Diagnostics = append(output.Diagnostics, diagnostics...)
 	}
 	return output, nil
+}
+
+// acceptanceOperationDelay is an opt-in local acceptance hook. It is useful
+// for proving that the service heartbeat remains independent from a long
+// validation operation; normal runtime behavior is unchanged when unset.
+func acceptanceOperationDelay(ctx context.Context) error {
+	value := os.Getenv("PLATFORMLENS_ACCEPTANCE_OPERATION_DELAY_MS")
+	if value == "" {
+		return nil
+	}
+	milliseconds, err := strconv.Atoi(value)
+	if err != nil || milliseconds <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(time.Duration(milliseconds) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (e *Engine) terraformModules(ctx context.Context, target domain.TerraformTarget, root string) ([]ModuleMetadata, bool, domain.ToolExecution, []domain.Diagnostic) {

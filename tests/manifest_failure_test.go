@@ -2,8 +2,10 @@ package tests
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/miku-wwl/platform-lens/internal/app"
@@ -18,15 +20,12 @@ import (
 	"github.com/miku-wwl/platform-lens/internal/validation"
 )
 
-func TestSQLiteFilesystemLocalE2E(t *testing.T) {
+func TestManifestPutFailureCannotCompleteRun(t *testing.T) {
 	fixture := t.TempDir()
 	git(t, fixture, "init", "-b", "main")
 	git(t, fixture, "config", "user.email", "platformlens@example.invalid")
 	git(t, fixture, "config", "user.name", "PlatformLens Test")
 	if err := os.WriteFile(filepath.Join(fixture, "main.tf"), []byte("terraform {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(fixture, "deployment.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: sample\nspec: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	git(t, fixture, "add", ".")
@@ -39,7 +38,6 @@ func TestSQLiteFilesystemLocalE2E(t *testing.T) {
 	config.WorkspaceDir = filepath.Join(config.DataDir, "workspaces")
 	config.SourceCacheDir = filepath.Join(config.DataDir, "cache")
 	config.ToolchainPath = filepath.Join(repositoryRoot(t), "toolchain.lock")
-	config.Limits.CommandTimeoutSeconds = 45
 	if err := config.Prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -47,52 +45,53 @@ func TestSQLiteFilesystemLocalE2E(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	clock := runtime.RealClock{}
-	repository, err := runs.OpenSQLite(config.DatabasePath, clock)
+	repository, err := runs.OpenSQLite(config.DatabasePath, runtime.RealClock{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer repository.Close()
-	artifacts, err := storage.NewFileSystem(config.ArtifactDir)
+	delegate, err := storage.NewFileSystem(config.ArtifactDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	failing := &manifestFailStorage{delegate: delegate}
 	sourceRuntime, err := source.NewRuntime(config, execution.NewCommandRunner())
 	if err != nil {
 		t.Fatal(err)
 	}
-	service := &app.Service{Config: config, Clock: clock, Repository: repository, Artifacts: artifacts, Source: sourceRuntime, Validation: validation.NewEngine(config, execution.NewCommandRunner(), toolchain), Reviewer: review.DeterministicFakeReviewer{}, Evaluator: evaluation.DeterministicFakeEvaluator{}, Toolchain: toolchain}
+	service := &app.Service{Config: config, Clock: runtime.RealClock{}, Repository: repository, Artifacts: failing, Source: sourceRuntime, Validation: validation.NewEngine(config, execution.NewCommandRunner(), toolchain), Reviewer: review.DeterministicFakeReviewer{}, Evaluator: evaluation.DeterministicFakeEvaluator{}, Toolchain: toolchain}
 	run, err := service.Submit(context.Background(), app.SubmitRequest{RepositoryURL: fixture, RequestedRef: "main"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	completed, err := service.Process(context.Background(), run.RunID)
+	final, err := service.Process(context.Background(), run.RunID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completed.State != domain.StateCompleted {
-		t.Fatalf("run did not complete: %+v", completed)
+	if final.State != domain.StateFailed || final.FailureCode != "PERSISTENCE_ERROR" || failing.manifestPuts != 1 {
+		t.Fatalf("manifest failure was not fenced before completion: %+v puts=%d", final, failing.manifestPuts)
 	}
-	if completed.CommitOID == "" || completed.ManifestURI == "" || completed.ManifestHash == "" || completed.LeaseOwner != "" || completed.LeaseExpiresAt != nil {
-		t.Fatalf("completion invariant missing: %+v", completed)
-	}
-	manifest, err := artifacts.Get(context.Background(), completed.ManifestURI)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(manifest) == 0 {
-		t.Fatal("manifest is empty")
-	}
-	if got := storage.Hash(manifest); got != completed.ManifestHash {
-		t.Fatalf("manifest hash mismatch: got %s want %s", got, completed.ManifestHash)
+	if final.ManifestURI != "" || final.WinningAttempt != nil {
+		t.Fatalf("failed run acquired authoritative completion fields: %+v", final)
 	}
 }
 
-func repositoryRoot(t *testing.T) string {
-	t.Helper()
-	cwd, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return filepath.Dir(cwd)
+type manifestFailStorage struct {
+	delegate     *storage.FileSystem
+	manifestPuts int
 }
+
+func (s *manifestFailStorage) Put(ctx context.Context, uri string, data []byte) (string, error) {
+	if strings.HasSuffix(uri, "/manifest.json") {
+		s.manifestPuts++
+		return "", errors.New("injected manifest put failure")
+	}
+	return s.delegate.Put(ctx, uri, data)
+}
+func (s *manifestFailStorage) Get(ctx context.Context, uri string) ([]byte, error) {
+	return s.delegate.Get(ctx, uri)
+}
+func (s *manifestFailStorage) Exists(ctx context.Context, uri string) (bool, error) {
+	return s.delegate.Exists(ctx, uri)
+}
+func (s *manifestFailStorage) Ready(ctx context.Context) error { return s.delegate.Ready(ctx) }

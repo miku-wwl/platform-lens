@@ -1,14 +1,18 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/domain"
 	"github.com/miku-wwl/platform-lens/internal/evaluation"
 	"github.com/miku-wwl/platform-lens/internal/evidence"
@@ -22,16 +26,17 @@ import (
 )
 
 type Service struct {
-	Config     runtime.Config
-	Clock      runtime.Clock
-	Repository runs.Repository
-	Artifacts  storage.ArtifactStorage
-	Source     *source.Runtime
-	Validation *validation.Engine
-	Reviewer   review.Reviewer
-	Evaluator  evaluation.SemanticEvaluator
-	Logger     *slog.Logger
-	Toolchain  runtime.Toolchain
+	Config      runtime.Config
+	Clock       runtime.Clock
+	Repository  runs.Repository
+	Artifacts   storage.ArtifactStorage
+	Source      *source.Runtime
+	Validation  *validation.Engine
+	Reviewer    review.Reviewer
+	Evaluator   evaluation.SemanticEvaluator
+	Logger      *slog.Logger
+	Toolchain   runtime.Toolchain
+	workerReady atomic.Bool
 }
 
 type SubmitRequest struct {
@@ -39,6 +44,28 @@ type SubmitRequest struct {
 	RequestedRef  string `json:"requested_ref"`
 	RequestedPath string `json:"requested_path,omitempty"`
 }
+
+func (s *Service) CheckDependencies(ctx context.Context) error {
+	if err := s.Repository.Ready(ctx); err != nil {
+		return fmt.Errorf("run repository is not ready: %w", err)
+	}
+	if err := s.Artifacts.Ready(ctx); err != nil {
+		return fmt.Errorf("artifact storage is not ready: %w", err)
+	}
+	return nil
+}
+
+func (s *Service) Ready(ctx context.Context) error {
+	if err := s.CheckDependencies(ctx); err != nil {
+		return err
+	}
+	if !s.workerReady.Load() {
+		return errors.New("worker is not accepting work")
+	}
+	return nil
+}
+
+func (s *Service) WorkerAccepting() bool { return s.workerReady.Load() }
 
 func (s *Service) Submit(ctx context.Context, request SubmitRequest) (domain.AnalysisRun, error) {
 	if request.RequestedRef == "" {
@@ -249,11 +276,19 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 	}
 	manifestPath := filepath.ToSlash(filepath.Join(prefix, "manifest.json"))
 	artifacts[manifestPath] = manifestBytes
-	if _, err = s.Artifacts.Put(attemptCtx, manifestPath, manifestBytes); err != nil {
+	manifestURI, err := s.Artifacts.Put(attemptCtx, manifestPath, manifestBytes)
+	if err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	manifestHash := report.Hash(manifestBytes)
-	final, err := s.Repository.CompleteRun(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, outcome, coverage, reviewStatus, evaluationStatus, manifestPath, manifestHash)
+	readBack, err := s.Artifacts.Get(attemptCtx, manifestURI)
+	if err != nil {
+		return fail("PERSISTENCE_ERROR", err)
+	}
+	if !bytes.Equal(readBack, manifestBytes) {
+		return fail("PERSISTENCE_ERROR", errors.New("manifest read-back bytes differ from authoritative write"))
+	}
+	manifestHash := report.Hash(readBack)
+	final, err := s.Repository.CompleteRun(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, outcome, coverage, reviewStatus, evaluationStatus, manifestURI, manifestHash)
 	if err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
@@ -316,6 +351,8 @@ func (s *Service) RecoverExpired(ctx context.Context, limit int) ([]domain.Analy
 }
 
 func (s *Service) WorkerLoop(ctx context.Context) {
+	s.workerReady.Store(true)
+	defer s.workerReady.Store(false)
 	interval := time.Duration(s.Config.WorkerPollSeconds) * time.Second
 	if interval <= 0 {
 		interval = 5 * time.Second
@@ -354,8 +391,37 @@ func (s *Service) startHeartbeat(ctx context.Context, cancel context.CancelFunc,
 				next := current.Add(time.Duration(s.Config.HeartbeatSeconds*2) * time.Second)
 				updated, err := s.Repository.RenewLease(heartbeatCtx, run.RunID, run.AttemptNo, s.Config.WorkerID, current, next)
 				if err != nil {
-					cancel()
-					return
+					if errors.Is(err, runs.ErrConditional) || errors.Is(err, runs.ErrFencingLost) || !cloudaws.IsRetryable(err) {
+						cancel()
+						return
+					}
+					maxAttempts := s.Config.AWSMaxAttempts
+					if maxAttempts < 2 {
+						maxAttempts = 2
+					}
+					for retryAttempt := 2; retryAttempt <= maxAttempts; retryAttempt++ {
+						if !s.Clock.Now().Before(current.Add(-time.Duration(maxInt(1, s.Config.HeartbeatSeconds)) * time.Second)) {
+							break
+						}
+						delay := time.NewTimer(time.Duration(retryAttempt-1) * 50 * time.Millisecond)
+						select {
+						case <-heartbeatCtx.Done():
+							delay.Stop()
+							return
+						case <-delay.C:
+						}
+						updated, err = s.Repository.RenewLease(heartbeatCtx, run.RunID, run.AttemptNo, s.Config.WorkerID, current, next)
+						if err == nil {
+							break
+						}
+						if errors.Is(err, runs.ErrConditional) || errors.Is(err, runs.ErrFencingLost) || !cloudaws.IsRetryable(err) {
+							break
+						}
+					}
+					if err != nil {
+						cancel()
+						return
+					}
 				}
 				if updated.LeaseExpiresAt != nil {
 					mu.Lock()
@@ -366,6 +432,13 @@ func (s *Service) startHeartbeat(ctx context.Context, cancel context.CancelFunc,
 		}
 	}()
 	return func() { stop(); <-done }
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 func Outcome(results []domain.ValidationResult, limits runtime.Limits) (domain.AnalysisOutcome, domain.CoverageStatus) {

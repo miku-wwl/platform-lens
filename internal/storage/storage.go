@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -12,9 +13,8 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 )
 
 type ArtifactStorage interface {
@@ -101,40 +101,29 @@ type S3 struct {
 	Bucket string
 }
 
-func NewS3(ctx context.Context, endpoint, region, bucket string) (*S3, error) {
-	options := []func(*config.LoadOptions) error{config.WithRegion(region)}
-	if endpoint != "" {
-		options = append(options, config.WithBaseEndpoint(endpoint), config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")))
-	}
-	cfg, err := config.LoadDefaultConfig(ctx, options...)
-	if err != nil {
-		return nil, err
-	}
-	client := s3.NewFromConfig(cfg, func(options *s3.Options) { options.UsePathStyle = true })
-	result := &S3{Client: client, Bucket: bucket}
-	if err := result.ensureBucket(ctx); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func (s *S3) ensureBucket(ctx context.Context) error {
-	_, err := s.Client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.Bucket)})
-	if err == nil {
-		return nil
-	}
-	_, err = s.Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(s.Bucket)})
-	return err
+func NewS3(config cloudaws.Config, bucket string) (*S3, error) {
+	client := s3.NewFromConfig(config.AWS, func(options *s3.Options) {
+		options.UsePathStyle = config.Endpoint != ""
+	})
+	return &S3{Client: client, Bucket: bucket}, nil
 }
 func (s *S3) Put(ctx context.Context, uri string, data []byte) (string, error) {
-	_, err := s.Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(uri), Body: strings.NewReader(string(data))})
+	key, err := s.key(uri)
 	if err != nil {
 		return "", err
 	}
-	return "s3://" + s.Bucket + "/" + uri, nil
+	_, err = s.Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key), Body: bytes.NewReader(data)})
+	if err != nil {
+		return "", err
+	}
+	return s.uri(key), nil
 }
 func (s *S3) Get(ctx context.Context, uri string) ([]byte, error) {
-	result, err := s.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(strings.TrimPrefix(uri, "s3://"+s.Bucket+"/"))})
+	key, err := s.key(uri)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key)})
 	if err != nil {
 		return nil, err
 	}
@@ -142,11 +131,12 @@ func (s *S3) Get(ctx context.Context, uri string) ([]byte, error) {
 	return io.ReadAll(result.Body)
 }
 func (s *S3) Exists(ctx context.Context, uri string) (bool, error) {
-	_, err := s.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(strings.TrimPrefix(uri, "s3://"+s.Bucket+"/"))})
+	key, err := s.key(uri)
 	if err != nil {
-		return false, nil
+		return false, err
 	}
-	return true, nil
+	_, err = s.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key)})
+	return classifyExistsError(err)
 }
 func (s *S3) Ready(ctx context.Context) error {
 	_, err := s.Client.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(s.Bucket)})
@@ -156,4 +146,31 @@ func (s *S3) Ready(ctx context.Context) error {
 func Hash(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
 func ArtifactURI(runID string, attempt int, name string) string {
 	return fmt.Sprintf("runs/%s/attempts/%d/%s", runID, attempt, filepath.ToSlash(name))
+}
+
+func (s *S3) key(uri string) (string, error) {
+	prefix := "s3://" + s.Bucket + "/"
+	if strings.HasPrefix(uri, "s3://") {
+		if !strings.HasPrefix(uri, prefix) {
+			return "", fmt.Errorf("artifact URI bucket mismatch: %s", uri)
+		}
+		uri = strings.TrimPrefix(uri, prefix)
+	}
+	uri = filepath.ToSlash(strings.TrimPrefix(uri, "/"))
+	if uri == "" || strings.Contains(uri, "..") {
+		return "", errors.New("invalid S3 artifact key")
+	}
+	return uri, nil
+}
+
+func (s *S3) uri(key string) string { return "s3://" + s.Bucket + "/" + key }
+
+func classifyExistsError(err error) (bool, error) {
+	if err == nil {
+		return true, nil
+	}
+	if cloudaws.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
 }

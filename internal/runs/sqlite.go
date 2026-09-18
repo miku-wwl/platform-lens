@@ -41,6 +41,11 @@ func OpenSQLite(path string, clock runtime.Clock) (*SQLiteRepository, error) {
 
 func (r *SQLiteRepository) Close() error { return r.db.Close() }
 
+func (r *SQLiteRepository) Ready(ctx context.Context) error {
+	var value int
+	return r.db.QueryRowContext(ctx, "SELECT 1").Scan(&value)
+}
+
 func (r *SQLiteRepository) initialize(ctx context.Context) error {
 	_, err := r.db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=30000; CREATE TABLE IF NOT EXISTS runs (
 run_id TEXT PRIMARY KEY, repository_url TEXT NOT NULL, requested_ref TEXT NOT NULL, resolved_ref TEXT, ref_type TEXT, commit_oid TEXT,

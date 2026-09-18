@@ -31,7 +31,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	if err := s.Service.Artifacts.Ready(r.Context()); err != nil {
+	if err := s.Service.Ready(r.Context()); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready", "error": err.Error()})
 		return
 	}

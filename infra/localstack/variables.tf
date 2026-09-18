@@ -22,3 +22,8 @@ variable "s3_bucket" {
   type    = string
   default = "platformlens-artifacts"
 }
+
+variable "worker_user_name" {
+  type    = string
+  default = "platformlens-worker"
+}
