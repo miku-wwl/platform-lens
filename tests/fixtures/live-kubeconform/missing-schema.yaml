@@ -1,0 +1,6 @@
+apiVersion: example.platformlens.invalid/v1
+kind: PlatformLensCustomThing
+metadata:
+  name: platformlens-custom
+spec:
+  arbitrary: true

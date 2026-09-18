@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -33,6 +34,12 @@ type FileLock struct {
 	handle *os.File
 }
 
+type lockOwner struct {
+	PID      int       `json:"pid"`
+	Hostname string    `json:"hostname"`
+	Started  time.Time `json:"started"`
+}
+
 func AcquireFileLock(path string, timeout time.Duration) (*FileLock, error) {
 	deadline := time.Now().Add(timeout)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -41,16 +48,49 @@ func AcquireFileLock(path string, timeout time.Duration) (*FileLock, error) {
 	for {
 		handle, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err == nil {
+			owner, _ := json.Marshal(lockOwner{PID: os.Getpid(), Hostname: hostname(), Started: time.Now().UTC()})
+			if _, writeErr := handle.Write(owner); writeErr != nil {
+				_ = handle.Close()
+				_ = os.Remove(path)
+				return nil, writeErr
+			}
 			return &FileLock{path: path, handle: handle}, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, err
+		}
+		if stale, ok := staleLock(path); ok && stale {
+			_ = os.Remove(path)
+			continue
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("repository lock timeout: %s", path)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func hostname() string {
+	value, err := os.Hostname()
+	if err != nil {
+		return "unknown-host"
+	}
+	return value
+}
+
+func staleLock(path string) (bool, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, false
+	}
+	var owner lockOwner
+	if json.Unmarshal(data, &owner) != nil || owner.PID <= 0 {
+		return false, false
+	}
+	if owner.Hostname != "" && owner.Hostname != hostname() {
+		return false, true
+	}
+	return !processAlive(owner.PID), true
 }
 
 func (l *FileLock) Close() error {
@@ -93,6 +133,9 @@ func CanonicalURL(value string, allowLocal bool) (string, error) {
 	if allowLocal && filepath.IsAbs(value) {
 		return value, nil
 	}
+	if strings.Contains(value, "\x00") || scpLike(value) {
+		return "", fmt.Errorf("only HTTPS repositories are supported")
+	}
 	parsed, err := url.Parse(value)
 	if err != nil {
 		return "", err
@@ -100,17 +143,34 @@ func CanonicalURL(value string, allowLocal bool) (string, error) {
 	if parsed.User != nil {
 		return "", fmt.Errorf("credential-bearing repository URL is rejected")
 	}
-	if parsed.Scheme == "http" || parsed.Scheme == "https" {
-		parsed.Scheme = strings.ToLower(parsed.Scheme)
+	if strings.EqualFold(parsed.Scheme, "https") {
+		parsed.Scheme = "https"
 		parsed.Host = strings.ToLower(parsed.Host)
+		if parsed.Host == "" {
+			return "", fmt.Errorf("HTTPS repository URL must include a host")
+		}
+		for key := range parsed.Query() {
+			key = strings.ToLower(key)
+			if strings.Contains(key, "token") || strings.Contains(key, "secret") || strings.Contains(key, "password") || strings.Contains(key, "credential") || strings.Contains(key, "api_key") {
+				return "", fmt.Errorf("credential-bearing repository URL is rejected")
+			}
+		}
 		parsed.RawQuery = ""
 		parsed.Fragment = ""
 		return parsed.String(), nil
 	}
-	if allowLocal && parsed.Scheme == "" {
+	if allowLocal && parsed.Scheme == "" && parsed.Host == "" && !strings.Contains(value, ":") {
 		return value, nil
 	}
 	return "", fmt.Errorf("only HTTPS repositories are supported")
+}
+
+func scpLike(value string) bool {
+	colon := strings.IndexByte(value, ':')
+	if colon <= 0 || strings.Contains(value[:colon], "/") || strings.Contains(value[:colon], "\\") {
+		return false
+	}
+	return strings.Contains(value[:colon], "@")
 }
 
 func NormalizeRef(value string) (string, error) {
@@ -163,8 +223,43 @@ func (r *Runtime) Acquire(ctx context.Context, repositoryURL, requestedRef strin
 	return AcquiredSource{CommitOID: oid, ResolvedRef: resolved, RefType: kind, CachePath: cache}, nil
 }
 
+// AcquirePinned materializes an already recorded commit without consulting the
+// requested branch or tag again. This is the recovery/replay path.
+func (r *Runtime) AcquirePinned(ctx context.Context, repositoryURL, commitOID, resolved string, refType domain.RefType) (AcquiredSource, error) {
+	canonical, err := CanonicalURL(repositoryURL, r.Config.AllowLocalGit)
+	if err != nil {
+		return AcquiredSource{}, err
+	}
+	if !fullOID.MatchString(commitOID) {
+		return AcquiredSource{}, ErrShortOID
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	cache := filepath.Join(r.Config.SourceCacheDir, hex.EncodeToString(sum[:])[:32])
+	lock, err := AcquireFileLock(cache+".lock", time.Minute)
+	if err != nil {
+		return AcquiredSource{}, err
+	}
+	defer lock.Close()
+	if err := r.ensureCache(ctx, cache, canonical); err != nil {
+		return AcquiredSource{}, err
+	}
+	if _, err := r.rev(ctx, cache, commitOID+"^{commit}"); err != nil {
+		if _, fetchErr := r.gitChecked(ctx, cache, "fetch", "--prune", "origin", commitOID); fetchErr != nil {
+			return AcquiredSource{}, fetchErr
+		}
+	}
+	oid, err := r.rev(ctx, cache, commitOID+"^{commit}")
+	if err != nil {
+		return AcquiredSource{}, err
+	}
+	if _, _, _, err := r.verify(ctx, cache, oid, resolved, refType); err != nil {
+		return AcquiredSource{}, err
+	}
+	return AcquiredSource{CommitOID: oid, ResolvedRef: resolved, RefType: refType, CachePath: cache}, nil
+}
+
 func (r *Runtime) env() map[string]string {
-	return map[string]string{"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": r.EmptyConfig, "GIT_CONFIG_SYSTEM": r.EmptyConfig, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "HOME": r.Home, "XDG_CONFIG_HOME": r.XDG}
+	return map[string]string{"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": r.EmptyConfig, "GIT_CONFIG_SYSTEM": r.EmptyConfig, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "", "GIT_CONFIG_COUNT": "0", "HOME": r.Home, "XDG_CONFIG_HOME": r.XDG, "GIT_TEMPLATE_DIR": r.EmptyHooks}
 }
 
 func (r *Runtime) IsolatedEnvironmentForTest() map[string]string { return r.env() }
@@ -203,7 +298,11 @@ func (r *Runtime) fetch(ctx context.Context, cache, ref string) error {
 		return err
 	}
 	if ref == "HEAD" {
-		_, err := r.gitChecked(ctx, cache, "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*")
+		remoteHead, err := r.remoteHead(ctx, cache)
+		if err != nil {
+			return err
+		}
+		_, err = r.gitChecked(ctx, cache, "fetch", "--prune", "origin", "+"+remoteHead+":"+remoteHead)
 		return err
 	}
 	normalized := strings.TrimPrefix(strings.TrimPrefix(ref, "refs/heads/"), "refs/tags/")
@@ -239,15 +338,15 @@ func (r *Runtime) resolve(ctx context.Context, cache, ref string) (string, strin
 		return r.verify(ctx, cache, oid, ref, domain.RefCommit)
 	}
 	if ref == "HEAD" {
-		oid, err := r.rev(ctx, cache, "HEAD^{commit}")
+		remoteHead, err := r.remoteHead(ctx, cache)
 		if err != nil {
 			return "", "", "", err
 		}
-		resolved := "HEAD"
-		if result, e := r.gitChecked(ctx, cache, "symbolic-ref", "-q", "HEAD"); e == nil {
-			resolved = strings.TrimSpace(string(result.Stdout))
+		oid, err := r.rev(ctx, cache, remoteHead+"^{commit}")
+		if err != nil {
+			return "", "", "", err
 		}
-		return r.verify(ctx, cache, oid, resolved, domain.RefHead)
+		return r.verify(ctx, cache, oid, remoteHead, domain.RefHead)
 	}
 	refs := []struct {
 		name string
@@ -295,6 +394,20 @@ func (r *Runtime) resolve(ctx context.Context, cache, ref string) (string, strin
 	return r.verify(ctx, cache, oid, existing[0].name, existing[0].kind)
 }
 
+func (r *Runtime) remoteHead(ctx context.Context, cache string) (string, error) {
+	result, err := r.gitChecked(ctx, cache, "ls-remote", "--symref", "origin", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(result.Stdout), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == "ref:" && fields[2] == "HEAD" && strings.HasPrefix(fields[1], "refs/heads/") {
+			return fields[1], nil
+		}
+	}
+	return "", fmt.Errorf("remote HEAD does not advertise a default branch")
+}
+
 func (r *Runtime) rev(ctx context.Context, cache, ref string) (string, error) {
 	result, err := r.gitChecked(ctx, cache, "rev-parse", "--verify", ref)
 	if err != nil {
@@ -310,7 +423,12 @@ func (r *Runtime) verify(ctx context.Context, cache, oid, resolved string, kind 
 	return oid, resolved, kind, nil
 }
 
-func (r *Runtime) CreateWorkspace(ctx context.Context, cache, oid string, attempt int) (string, error) {
+func (r *Runtime) CreateWorkspace(ctx context.Context, cache, oid, runID string, attempt int) (string, error) {
+	lock, err := AcquireFileLock(cache+".lock", time.Minute)
+	if err != nil {
+		return "", err
+	}
+	defer lock.Close()
 	workspace := filepath.Join(r.Config.WorkspaceDir, fmt.Sprintf("attempt-%d-%s-%s", attempt, oid[:12], runtime.NewID()))
 	if err := os.MkdirAll(filepath.Dir(workspace), 0o700); err != nil {
 		return "", err
@@ -318,14 +436,37 @@ func (r *Runtime) CreateWorkspace(ctx context.Context, cache, oid string, attemp
 	if _, err := r.gitChecked(ctx, cache, "-c", "core.hooksPath="+r.EmptyHooks, "-c", "credential.helper=", "worktree", "add", "--detach", workspace, oid); err != nil {
 		return "", err
 	}
+	marker := WorkspaceMarker{RunID: runID, AttemptNo: attempt, CommitOID: oid, CreatedAt: time.Now().UTC()}
+	data, _ := json.Marshal(marker)
+	if err := os.WriteFile(filepath.Join(workspace, ".platformlens-workspace.json"), data, 0o600); err != nil {
+		_, _ = r.gitChecked(ctx, cache, "worktree", "remove", "--force", workspace)
+		return "", err
+	}
 	return workspace, nil
 }
 func (r *Runtime) CleanupWorkspace(ctx context.Context, cache, workspace string) error {
+	lock, err := AcquireFileLock(cache+".lock", time.Minute)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
 	_, _ = r.gitChecked(ctx, cache, "-c", "core.hooksPath="+r.EmptyHooks, "-c", "credential.helper=", "worktree", "remove", "--force", workspace)
 	return os.RemoveAll(workspace)
 }
 
-func SweepWorkspaces(root string, maxAge time.Duration) ([]string, error) {
+type WorkspaceMarker struct {
+	RunID     string    `json:"run_id"`
+	AttemptNo int       `json:"attempt_no"`
+	CommitOID string    `json:"commit_oid"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// SweepWorkspaces is conservative by default. Callers must supply ownership
+// knowledge before any old workspace is removed.
+func SweepWorkspaces(root string, maxAge time.Duration, protected ...func(WorkspaceMarker) bool) ([]string, error) {
+	if len(protected) == 0 {
+		return nil, nil
+	}
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -341,6 +482,14 @@ func SweepWorkspaces(root string, maxAge time.Duration) ([]string, error) {
 			continue
 		}
 		path := filepath.Join(root, entry.Name())
+		data, err := os.ReadFile(filepath.Join(path, ".platformlens-workspace.json"))
+		if err != nil {
+			continue
+		}
+		var marker WorkspaceMarker
+		if json.Unmarshal(data, &marker) != nil || protected[0](marker) {
+			continue
+		}
 		if err := os.RemoveAll(path); err == nil {
 			removed = append(removed, path)
 		}

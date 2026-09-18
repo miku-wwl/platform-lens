@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"path/filepath"
 	"sync"
@@ -43,6 +44,11 @@ func (s *Service) Submit(ctx context.Context, request SubmitRequest) (domain.Ana
 	if request.RequestedRef == "" {
 		request.RequestedRef = "HEAD"
 	}
+	canonical, err := source.CanonicalURL(request.RepositoryURL, s.Config.AllowLocalGit)
+	if err != nil {
+		return domain.AnalysisRun{}, err
+	}
+	request.RepositoryURL = canonical
 	return s.Repository.CreateRun(ctx, request.RepositoryURL, request.RequestedRef, request.RequestedPath)
 }
 
@@ -57,9 +63,13 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 			return domain.AnalysisRun{}, err
 		}
 	}
+	if run.LeaseOwner != s.Config.WorkerID {
+		return run, nil
+	}
 	if run.State != domain.StateClaimed {
 		return run, nil
 	}
+	attemptNo, workerID := run.AttemptNo, s.Config.WorkerID
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	heartbeat := s.startHeartbeat(attemptCtx, cancel, run)
@@ -72,29 +82,36 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		}
 	}()
 	fail := func(code string, cause error) (domain.AnalysisRun, error) {
-		current, getErr := s.Repository.GetRun(context.Background(), runID)
-		if getErr == nil && current.State.Active() && current.LeaseOwner == s.Config.WorkerID {
-			failed, failErr := s.Repository.FailRun(context.Background(), runID, current.AttemptNo, s.Config.WorkerID, code, cause.Error())
-			if failErr == nil {
-				return failed, nil
-			}
-			return current, failErr
+		failed, failErr := s.Repository.FailRun(context.Background(), runID, attemptNo, workerID, code, cause.Error())
+		if failErr == nil {
+			return failed, nil
 		}
-		return current, cause
+		current, getErr := s.Repository.GetRun(context.Background(), runID)
+		if getErr == nil {
+			return current, cause
+		}
+		return domain.AnalysisRun{}, cause
 	}
 	if _, err = s.Repository.UpdatePhase(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, domain.StateClaimed, domain.StateRetrieving); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	acquired, err := s.Source.Acquire(attemptCtx, run.RepositoryURL, run.RequestedRef)
+	var acquired source.AcquiredSource
+	if run.CommitOID != "" {
+		acquired, err = s.Source.AcquirePinned(attemptCtx, run.RepositoryURL, run.CommitOID, run.ResolvedRef, run.RefType)
+	} else {
+		acquired, err = s.Source.Acquire(attemptCtx, run.RepositoryURL, run.RequestedRef)
+	}
 	if err != nil {
 		return fail("SOURCE_ERROR", err)
 	}
 	cache = acquired.CachePath
-	run, err = s.Repository.PinSourceIfAbsent(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, acquired.CommitOID, acquired.ResolvedRef, acquired.RefType)
-	if err != nil {
-		return fail("PERSISTENCE_ERROR", err)
+	if run.CommitOID == "" {
+		run, err = s.Repository.PinSourceIfAbsent(attemptCtx, runID, attemptNo, workerID, acquired.CommitOID, acquired.ResolvedRef, acquired.RefType)
+		if err != nil {
+			return fail("PERSISTENCE_ERROR", err)
+		}
 	}
-	workspace, err = s.Source.CreateWorkspace(attemptCtx, cache, acquired.CommitOID, run.AttemptNo)
+	workspace, err = s.Source.CreateWorkspace(attemptCtx, cache, acquired.CommitOID, run.RunID, run.AttemptNo)
 	if err != nil {
 		return fail("SOURCE_ERROR", err)
 	}
@@ -131,9 +148,6 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 	if err := addJSON(filepath.Join(prefix, "diagnostics.json"), output.Diagnostics); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	if err := addJSON(filepath.Join(prefix, "source-excerpts.json"), []any{}); err != nil {
-		return fail("PERSISTENCE_ERROR", err)
-	}
 	if err := addJSON(filepath.Join(prefix, "tool-executions.json"), output.Executions); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
@@ -151,9 +165,30 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 	evidenceItems := []domain.EvidenceEnvelope{}
 	for _, item := range output.Diagnostics {
 		evidenceItems = append(evidenceItems, evidence.Diagnostic(runID, run.AttemptNo, acquired.CommitOID, item, s.Clock))
+		if item.File != "" && item.StartLine > 0 {
+			endLine := item.EndLine
+			if endLine < item.StartLine {
+				endLine = item.StartLine
+			}
+			if excerpt, excerptErr := evidence.SourceExcerpt(workspace, item.File, item.StartLine, endLine, runID, run.AttemptNo, acquired.CommitOID, s.Config.Limits.MaxSourceExcerptBytes, s.Clock); excerptErr == nil {
+				evidenceItems = append(evidenceItems, excerpt)
+			}
+		}
 	}
 	for _, item := range output.Executions {
 		evidenceItems = append(evidenceItems, evidence.Tool(runID, run.AttemptNo, acquired.CommitOID, item, s.Clock))
+	}
+	sourceExcerpts := []domain.EvidenceEnvelope{}
+	for _, item := range evidenceItems {
+		if item.EvidenceType == domain.EvidenceSource {
+			sourceExcerpts = append(sourceExcerpts, item)
+		}
+		if err := addJSON(filepath.Join(prefix, "evidence", item.EvidenceID+".json"), item); err != nil {
+			return fail("PERSISTENCE_ERROR", err)
+		}
+	}
+	if err := addJSON(filepath.Join(prefix, "source-excerpts.json"), sourceExcerpts); err != nil {
+		return fail("PERSISTENCE_ERROR", err)
 	}
 	contextInput := evidence.BuildContext(output.Diagnostics, evidenceItems, s.Config.Limits.MaxAgentContextBytes)
 	reviewerOutput, reviewerErr := s.Reviewer.Review(attemptCtx, review.Input{Context: contextInput})
@@ -167,11 +202,6 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		}
 		if err := addJSON(filepath.Join(prefix, "reviewer.json"), reviewerOutput); err != nil {
 			return fail("PERSISTENCE_ERROR", err)
-		}
-		for _, item := range evidenceItems {
-			if err := addJSON(filepath.Join(prefix, "evidence", item.EvidenceID+".json"), item); err != nil {
-				return fail("PERSISTENCE_ERROR", err)
-			}
 		}
 	}
 	if _, err = s.Repository.UpdatePhase(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, domain.StateReviewing, domain.StateEvaluating); err != nil {
@@ -228,6 +258,80 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		return fail("PERSISTENCE_ERROR", err)
 	}
 	return final, nil
+}
+
+// ProcessQueuedAndReclaim is the smallest Stage 1 worker poll: it claims new
+// work, atomically reclaims expired attempts, and replays each claimed attempt.
+func (s *Service) ProcessQueuedAndReclaim(ctx context.Context, limit int) error {
+	if limit <= 0 {
+		limit = 16
+	}
+	queued, err := s.Repository.FindQueuedCandidates(ctx, limit)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range queued {
+		claimed, claimErr := s.Repository.ClaimRun(ctx, candidate.RunID, s.Config.WorkerID, time.Duration(s.Config.LeaseSeconds)*time.Second)
+		if errors.Is(claimErr, runs.ErrConditional) {
+			continue
+		}
+		if claimErr != nil {
+			return claimErr
+		}
+		_, _ = s.Process(ctx, claimed.RunID)
+	}
+	_, err = s.RecoverExpired(ctx, limit)
+	return err
+}
+
+// RecoverExpired reclaims and replays expired attempts. Conditional failures
+// are expected when another worker wins the race and are ignored.
+func (s *Service) RecoverExpired(ctx context.Context, limit int) ([]domain.AnalysisRun, error) {
+	if limit <= 0 {
+		limit = 16
+	}
+	candidates, err := s.Repository.FindReclaimCandidates(ctx, s.Clock.Now(), limit)
+	if err != nil {
+		return nil, err
+	}
+	completed := make([]domain.AnalysisRun, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.LeaseExpiresAt == nil {
+			continue
+		}
+		reclaimed, reclaimErr := s.Repository.ReclaimExpiredRun(ctx, candidate.RunID, candidate.AttemptNo, candidate.LeaseOwner, *candidate.LeaseExpiresAt, candidate.State, s.Config.WorkerID, s.Clock.Now(), time.Duration(s.Config.LeaseSeconds)*time.Second)
+		if errors.Is(reclaimErr, runs.ErrConditional) {
+			continue
+		}
+		if reclaimErr != nil {
+			return completed, reclaimErr
+		}
+		processed, processErr := s.Process(ctx, reclaimed.RunID)
+		if processErr != nil {
+			return completed, processErr
+		}
+		completed = append(completed, processed)
+	}
+	return completed, nil
+}
+
+func (s *Service) WorkerLoop(ctx context.Context) {
+	interval := time.Duration(s.Config.WorkerPollSeconds) * time.Second
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := s.ProcessQueuedAndReclaim(ctx, 16); err != nil && s.Logger != nil {
+			s.Logger.Error("worker poll failed", "error", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Service) startHeartbeat(ctx context.Context, cancel context.CancelFunc, run domain.AnalysisRun) func() {

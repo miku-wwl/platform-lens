@@ -7,7 +7,7 @@
     "version": "0.6.7",
     "kubernetes_version": "1.30.0",
     "schema_repository": "https://github.com/yannh/kubernetes-json-schema",
-    "schema_repository_commit": "v1.30.0",
-    "schema_location_template": "default"
+    "schema_repository_commit": "c9452fcf5ef03628ab8b07e5b3a6b6f989e543bf",
+    "schema_location_template": "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/{commit}/v1.30.0-standalone-strict/{{ .ResourceKind }}{{ .KindSuffix }}.json"
   }
 }

@@ -2,6 +2,9 @@ package tests
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -62,6 +65,44 @@ func TestModuleHashIgnoresMtimeAndAbsoluteRoot(t *testing.T) {
 	}
 	if first != second {
 		t.Fatalf("same content has different hashes: %s %s", first, second)
+	}
+}
+
+func TestTerraformProvenanceSourceVsGeneratedAndModuleHash(t *testing.T) {
+	workspace := t.TempDir()
+	root := filepath.Join(workspace, "root")
+	if err := os.MkdirAll(filepath.Join(root, ".terraform", "modules", "child"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".terraform", "modules", "child", "main.tf"), []byte("module content\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial := []byte("provider \"x\" {\n  version = \"1.0.0\"\n}\n")
+	if err := os.WriteFile(filepath.Join(root, ".terraform.lock.hcl"), initial, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initialSum := sha256.Sum256(initial)
+	updated := []byte("provider \"x\" {\n  version = \"2.0.0\"\n}\n")
+	if err := os.WriteFile(filepath.Join(root, ".terraform.lock.hcl"), updated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sourceTarget := domain.TerraformTarget{TargetID: "target-source", RootPath: "root", LockfilePresent: true, SourceLockfileHash: hex.EncodeToString(initialSum[:])}
+	metadata := []validation.ModuleMetadata{{ModuleKey: "child", DeclaredSource: "./child", DeclaredVersionOrRef: "1.0.0", ResolvedVersion: "1.0.0", ResolvedLocalPath: filepath.ToSlash(filepath.Join("root", ".terraform", "modules", "child"))}}
+	source := validation.BuildProvenance(workspace, sourceTarget, metadata, true)
+	if source.LockfileOrigin != "SOURCE" || source.SourceLockfileHash != sourceTarget.SourceLockfileHash || source.EffectiveLockfileHash == source.SourceLockfileHash || source.ModuleProvenanceStatus != "COMPLETE" || len(source.Modules) != 1 || source.Modules[0].ContentTreeHash == "" {
+		t.Fatalf("source provenance incorrect: %+v", source)
+	}
+	generatedTarget := domain.TerraformTarget{TargetID: "target-generated", RootPath: "root", LockfilePresent: false}
+	generated := validation.BuildProvenance(workspace, generatedTarget, metadata, true)
+	if generated.LockfileOrigin != "GENERATED" || generated.SourceLockfileHash != "" || generated.EffectiveLockfileHash == "" {
+		t.Fatalf("generated provenance incorrect: %+v", generated)
+	}
+	partial := validation.BuildProvenance(workspace, sourceTarget, []validation.ModuleMetadata{{ModuleKey: "child", ResolvedLocalPath: filepath.ToSlash(filepath.Join("root", ".terraform", "modules", "child"))}}, true)
+	if partial.ModuleProvenanceStatus != "PARTIAL" || len(partial.Modules) != 1 || partial.Modules[0].ContentTreeHash == "" {
+		t.Fatalf("incomplete module metadata should remain partial: %+v", partial)
+	}
+	if _, err := json.Marshal(source); err != nil {
+		t.Fatal(err)
 	}
 }
 

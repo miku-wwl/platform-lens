@@ -68,6 +68,8 @@ func (t Toolchain) Actual(tool string) string {
 	args := []string{"--version"}
 	if tool == "terraform" {
 		args = []string{"version"}
+	} else if tool == "kubeconform" {
+		args = []string{"-v"}
 	}
 	path, err := exec.LookPath(name)
 	if err != nil {
@@ -89,6 +91,18 @@ func (t Toolchain) Check(tool string) (bool, string, string) {
 	expected := t.Expected(tool)
 	actual := t.Actual(tool)
 	return actual == expected, actual, expected
+}
+
+func (t Toolchain) Verify(tool string, allowOverride bool) (string, error) {
+	expected := t.Expected(tool)
+	actual := t.Actual(tool)
+	if actual == "" {
+		return "", fmt.Errorf("%s executable is missing or version output is malformed", tool)
+	}
+	if actual != expected && !allowOverride {
+		return actual, fmt.Errorf("%s version mismatch: expected %s, observed %s", tool, expected, actual)
+	}
+	return actual, nil
 }
 
 func (t Toolchain) Report() map[string]any {

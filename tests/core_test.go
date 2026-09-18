@@ -149,6 +149,7 @@ func TestGitFixture(t *testing.T) {
 	git(t, repo, "branch", "ambiguous")
 	git(t, repo, "tag", "ambiguous")
 	config := runtime.DefaultConfig()
+	config.AllowLocalGit = true
 	config.DataDir = filepath.Join(t.TempDir(), "data")
 	config.SourceCacheDir = filepath.Join(config.DataDir, "cache")
 	config.WorkspaceDir = filepath.Join(config.DataDir, "workspaces")
@@ -169,6 +170,10 @@ func TestGitFixture(t *testing.T) {
 	}
 	if acquired.RefType != domain.RefTag {
 		t.Fatalf("unexpected ref type: %s", acquired.RefType)
+	}
+	head, err := runtimeGit.Acquire(context.Background(), repo, "HEAD")
+	if err != nil || head.CommitOID != oid || head.ResolvedRef != "refs/heads/main" {
+		t.Fatalf("remote HEAD should resolve main: %+v err=%v", head, err)
 	}
 	if _, err := runtimeGit.Acquire(context.Background(), repo, "ambiguous"); !errors.Is(err, source.ErrAmbiguousRef) {
 		t.Fatalf("ambiguous ref should fail: %v", err)

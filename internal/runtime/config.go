@@ -21,24 +21,26 @@ type Limits struct {
 }
 
 type Config struct {
-	ServiceName      string `json:"service_name"`
-	Version          string `json:"version"`
-	DataDir          string `json:"data_dir"`
-	DatabasePath     string `json:"database_path"`
-	ArtifactDir      string `json:"artifact_dir"`
-	WorkspaceDir     string `json:"workspace_dir"`
-	SourceCacheDir   string `json:"source_cache_dir"`
-	ToolchainPath    string `json:"toolchain_path"`
-	WorkerID         string `json:"worker_id"`
-	LeaseSeconds     int    `json:"lease_seconds"`
-	HeartbeatSeconds int    `json:"heartbeat_seconds"`
-	AWSEndpointURL   string `json:"aws_endpoint_url,omitempty"`
-	AWSRegion        string `json:"aws_region"`
-	DynamoTable      string `json:"dynamodb_table"`
-	DynamoGSI        string `json:"dynamodb_gsi"`
-	S3Bucket         string `json:"s3_bucket"`
-	AllowLocalGit    bool   `json:"allow_local_git"`
-	Limits           Limits `json:"limits"`
+	ServiceName            string `json:"service_name"`
+	Version                string `json:"version"`
+	DataDir                string `json:"data_dir"`
+	DatabasePath           string `json:"database_path"`
+	ArtifactDir            string `json:"artifact_dir"`
+	WorkspaceDir           string `json:"workspace_dir"`
+	SourceCacheDir         string `json:"source_cache_dir"`
+	ToolchainPath          string `json:"toolchain_path"`
+	WorkerID               string `json:"worker_id"`
+	LeaseSeconds           int    `json:"lease_seconds"`
+	HeartbeatSeconds       int    `json:"heartbeat_seconds"`
+	AWSEndpointURL         string `json:"aws_endpoint_url,omitempty"`
+	AWSRegion              string `json:"aws_region"`
+	DynamoTable            string `json:"dynamodb_table"`
+	DynamoGSI              string `json:"dynamodb_gsi"`
+	S3Bucket               string `json:"s3_bucket"`
+	AllowLocalGit          bool   `json:"allow_local_git"`
+	AllowToolchainOverride bool   `json:"allow_toolchain_override"`
+	WorkerPollSeconds      int    `json:"worker_poll_seconds"`
+	Limits                 Limits `json:"limits"`
 }
 
 func DefaultConfig() Config {
@@ -46,9 +48,10 @@ func DefaultConfig() Config {
 		ServiceName: "platformlens", Version: "0.1.0", DataDir: ".platformlens",
 		DatabasePath: ".platformlens/platformlens.sqlite3", ArtifactDir: ".platformlens/artifacts",
 		WorkspaceDir: ".platformlens/workspaces", SourceCacheDir: ".platformlens/source-cache",
-		ToolchainPath: "toolchain.lock", WorkerID: "local-worker", LeaseSeconds: 60,
+		ToolchainPath: "toolchain.lock", WorkerID: NewWorkerID(), LeaseSeconds: 60,
 		HeartbeatSeconds: 15, AWSRegion: "us-east-1", DynamoTable: "platformlens-runs",
-		DynamoGSI: "candidate-index", S3Bucket: "platformlens-artifacts", AllowLocalGit: true,
+		DynamoGSI: "candidate-index", S3Bucket: "platformlens-artifacts", AllowLocalGit: false,
+		WorkerPollSeconds: 5,
 		Limits: Limits{MaxRepoBytes: 512 * 1024 * 1024, MaxFiles: 50000, MaxTargets: 128,
 			MaxDiagnostics: 10000, MaxRawOutputBytes: 2 * 1024 * 1024, MaxSourceExcerptBytes: 32 * 1024,
 			MaxAgentContextBytes: 128 * 1024, MaxFindings: 1000, CommandTimeoutSeconds: 300},
@@ -68,6 +71,15 @@ func LoadConfig() Config {
 	setString(&c.AWSRegion, "AWS_REGION")
 	setString(&c.DynamoTable, "PLATFORMLENS_DYNAMODB_TABLE")
 	setString(&c.S3Bucket, "PLATFORMLENS_S3_BUCKET")
+	if value := os.Getenv("PLATFORMLENS_ALLOW_LOCAL_GIT"); value != "" {
+		c.AllowLocalGit = parseBool(value, c.AllowLocalGit)
+	}
+	if value := os.Getenv("PLATFORMLENS_ALLOW_TOOLCHAIN_OVERRIDE"); value != "" {
+		c.AllowToolchainOverride = parseBool(value, c.AllowToolchainOverride)
+	}
+	if value := os.Getenv("PLATFORMLENS_WORKER_POLL_SECONDS"); value != "" {
+		c.WorkerPollSeconds = parseInt(value, c.WorkerPollSeconds)
+	}
 	if value := os.Getenv("PLATFORMLENS_LEASE_SECONDS"); value != "" {
 		c.LeaseSeconds = parseInt(value, c.LeaseSeconds)
 	}
@@ -101,7 +113,7 @@ func (c Config) Prepare() error {
 }
 
 func (c Config) Validate() error {
-	if c.LeaseSeconds <= 0 || c.HeartbeatSeconds <= 0 {
+	if c.LeaseSeconds <= 0 || c.HeartbeatSeconds <= 0 || c.WorkerPollSeconds <= 0 {
 		return errors.New("lease and heartbeat seconds must be positive")
 	}
 	for name, value := range map[string]int64{"max_repo_bytes": c.Limits.MaxRepoBytes, "max_files": int64(c.Limits.MaxFiles), "max_targets": int64(c.Limits.MaxTargets), "max_diagnostics": int64(c.Limits.MaxDiagnostics), "max_raw_output_bytes": int64(c.Limits.MaxRawOutputBytes), "max_source_excerpt_bytes": int64(c.Limits.MaxSourceExcerptBytes), "max_agent_context_bytes": int64(c.Limits.MaxAgentContextBytes), "max_findings": int64(c.Limits.MaxFindings), "command_timeout_seconds": int64(c.Limits.CommandTimeoutSeconds)} {
@@ -121,6 +133,14 @@ func setString(target *string, name string) {
 }
 func parseInt(value string, fallback int) int {
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func parseBool(value string, fallback bool) bool {
+	parsed, err := strconv.ParseBool(value)
 	if err != nil {
 		return fallback
 	}

@@ -32,6 +32,7 @@ func TestSQLiteFilesystemLocalE2E(t *testing.T) {
 	git(t, fixture, "add", ".")
 	git(t, fixture, "commit", "-m", "fixture")
 	config := runtime.DefaultConfig()
+	config.AllowLocalGit = true
 	config.DataDir = t.TempDir()
 	config.DatabasePath = filepath.Join(config.DataDir, "runs.db")
 	config.ArtifactDir = filepath.Join(config.DataDir, "artifacts")

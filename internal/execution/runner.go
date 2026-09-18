@@ -128,7 +128,7 @@ func waitWithGrace(done <-chan error, grace time.Duration, cmd *exec.Cmd) error 
 }
 
 func allowlistedEnvironment(base, overrides map[string]string) []string {
-	allowed := map[string]bool{"PATH": true, "Path": true, "SYSTEMROOT": true, "SystemRoot": true, "WINDIR": true, "TEMP": true, "TMP": true, "HOME": true, "USERPROFILE": true, "LANG": true, "LC_ALL": true, "GIT_CONFIG_NOSYSTEM": true, "GIT_CONFIG_GLOBAL": true, "GIT_TERMINAL_PROMPT": true, "XDG_CONFIG_HOME": true, "GIT_ASKPASS": true, "TF_IN_AUTOMATION": true, "TF_INPUT": true, "TF_DATA_DIR": true, "TF_CLI_CONFIG_FILE": true, "AWS_REGION": true, "AWS_DEFAULT_REGION": true, "AWS_ENDPOINT_URL": true}
+	allowed := map[string]bool{"PATH": true, "Path": true, "SYSTEMROOT": true, "SystemRoot": true, "WINDIR": true, "TEMP": true, "TMP": true, "HOME": true, "USERPROFILE": true, "LANG": true, "LC_ALL": true, "GIT_CONFIG_NOSYSTEM": true, "GIT_CONFIG_GLOBAL": true, "GIT_CONFIG_SYSTEM": true, "GIT_CONFIG_COUNT": true, "GIT_CONFIG_PARAMETERS": true, "GIT_TEMPLATE_DIR": true, "GIT_TERMINAL_PROMPT": true, "XDG_CONFIG_HOME": true, "GIT_ASKPASS": true, "TF_IN_AUTOMATION": true, "TF_INPUT": true, "TF_DATA_DIR": true, "TF_CLI_CONFIG_FILE": true, "AWS_REGION": true, "AWS_DEFAULT_REGION": true, "AWS_ENDPOINT_URL": true}
 	values := map[string]string{}
 	for key, value := range base {
 		if allowed[key] {

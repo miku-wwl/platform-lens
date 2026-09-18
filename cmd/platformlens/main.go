@@ -101,6 +101,7 @@ func serve(service *app.Service, server api.Server) {
 	}
 	address := host + ":" + port
 	service.Logger.Info("server starting", "address", address)
+	go service.WorkerLoop(context.Background())
 	if err := http.ListenAndServe(address, server.Handler()); err != nil {
 		service.Logger.Error("server stopped", "error", err)
 		os.Exit(1)

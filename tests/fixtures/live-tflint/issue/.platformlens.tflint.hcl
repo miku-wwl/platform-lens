@@ -1,0 +1,1 @@
+plugin "terraform" { enabled = true }

@@ -3,6 +3,7 @@ package validation
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,24 +11,131 @@ import (
 	"strings"
 
 	"github.com/miku-wwl/platform-lens/internal/domain"
+	"github.com/miku-wwl/platform-lens/internal/security"
 )
 
-func BuildProvenance(workspace string, target domain.TerraformTarget) domain.TerraformDependencyProvenance {
+type ModuleMetadata struct {
+	ModuleKey            string
+	DeclaredSource       string
+	DeclaredVersionOrRef string
+	ResolvedVersion      string
+	ResolvedVCSRevision  string
+	ResolvedLocalPath    string
+}
+
+// BuildProvenance consumes public `terraform modules -json` metadata. The
+// caller supplies whether that command completed with valid JSON so an absent
+// module graph is represented as PARTIAL rather than inferred from Terraform's
+// internal cache files.
+func BuildProvenance(workspace string, target domain.TerraformTarget, metadata []ModuleMetadata, metadataAvailable bool) domain.TerraformDependencyProvenance {
 	root := filepath.Join(workspace, filepath.FromSlash(target.RootPath))
 	lockfile := filepath.Join(root, ".terraform.lock.hcl")
 	data, err := os.ReadFile(lockfile)
-	source := err == nil
+	effectivePresent := err == nil
 	hash := ""
-	if source {
+	if effectivePresent {
 		hash = hashBytes(data)
 	}
 	providers := parseProviders(string(data))
-	effectiveHash := hash
 	status := "PARTIAL"
-	if source && len(providers) > 0 {
+	if target.LockfilePresent && len(providers) > 0 {
 		status = "COMPLETE"
 	}
-	return domain.TerraformDependencyProvenance{TargetID: target.TargetID, SourceLockfilePresent: source, SourceLockfileHash: target.SourceLockfileHash, EffectiveLockfileHash: effectiveHash, LockfileOrigin: map[bool]string{true: "SOURCE", false: "GENERATED"}[source], ProviderProvenanceStatus: status, Providers: providers, ModuleProvenanceStatus: "PARTIAL", Modules: []domain.ModuleProvenance{}}
+	modules, moduleStatus := resolveModules(workspace, target.TargetID, metadata, metadataAvailable)
+	origin := "GENERATED"
+	if target.LockfilePresent {
+		origin = "SOURCE"
+	}
+	return domain.TerraformDependencyProvenance{TargetID: target.TargetID, SourceLockfilePresent: target.LockfilePresent, SourceLockfileHash: target.SourceLockfileHash, EffectiveLockfileHash: hash, LockfileOrigin: origin, ProviderProvenanceStatus: status, Providers: providers, ModuleProvenanceStatus: moduleStatus, Modules: modules}
+}
+
+func resolveModules(workspace, targetID string, metadata []ModuleMetadata, metadataAvailable bool) ([]domain.ModuleProvenance, string) {
+	if !metadataAvailable {
+		return []domain.ModuleProvenance{}, "PARTIAL"
+	}
+	result := make([]domain.ModuleProvenance, 0, len(metadata))
+	complete := true
+	for _, module := range metadata {
+		item := domain.ModuleProvenance{TargetID: targetID, ModuleKey: module.ModuleKey, DeclaredSource: module.DeclaredSource, DeclaredVersionOrRef: module.DeclaredVersionOrRef, ResolvedVersion: module.ResolvedVersion, ResolvedVCSRevision: module.ResolvedVCSRevision, HashVersion: 1}
+		if item.ModuleKey == "" || item.DeclaredSource == "" {
+			complete = false
+		}
+		if module.ResolvedLocalPath != "" {
+			if path, err := security.ResolveExistingWithin(workspace, module.ResolvedLocalPath); err == nil {
+				if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+					item.ResolvedLocalPath = filepath.ToSlash(module.ResolvedLocalPath)
+					item.ContentTreeHash, _ = CanonicalModuleTreeHash(path)
+				}
+			}
+		}
+		if item.ContentTreeHash == "" {
+			complete = false
+		}
+		result = append(result, item)
+	}
+	if !complete {
+		return result, "PARTIAL"
+	}
+	return result, "COMPLETE"
+}
+
+// ParseModulesJSON accepts the public Terraform CLI JSON envelope and keeps
+// only metadata fields. It intentionally does not read .terraform internals.
+func ParseModulesJSON(data []byte) ([]ModuleMetadata, error) {
+	var root any
+	if err := json.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	result := []ModuleMetadata{}
+	seen := map[string]bool{}
+	var visit func(any)
+	visit = func(value any) {
+		switch value := value.(type) {
+		case []any:
+			for _, item := range value {
+				visit(item)
+			}
+		case map[string]any:
+			if nested, ok := value["modules"]; ok {
+				visit(nested)
+			}
+			if nested, ok := value["Modules"]; ok {
+				visit(nested)
+			}
+			item := ModuleMetadata{
+				ModuleKey:            firstJSONString(value, "key", "Key", "module_key", "ModuleKey"),
+				DeclaredSource:       firstJSONString(value, "source", "Source", "declared_source", "DeclaredSource"),
+				DeclaredVersionOrRef: firstJSONString(value, "version", "Version", "ref", "Ref", "declared_version_or_ref", "DeclaredVersionOrRef"),
+				ResolvedVersion:      firstJSONString(value, "resolved_version", "ResolvedVersion", "version", "Version"),
+				ResolvedVCSRevision:  firstJSONString(value, "revision", "Revision", "vcs_revision", "VCSRevision", "resolved_vcs_revision", "ResolvedVCSRevision"),
+				ResolvedLocalPath:    firstJSONString(value, "dir", "Dir", "path", "Path", "directory", "Directory", "resolved_local_path", "ResolvedLocalPath"),
+			}
+			if item.ModuleKey != "" || item.DeclaredSource != "" || item.ResolvedLocalPath != "" {
+				identity := item.ModuleKey + "\x00" + item.DeclaredSource + "\x00" + item.ResolvedLocalPath
+				if !seen[identity] {
+					seen[identity] = true
+					result = append(result, item)
+				}
+			}
+			for key, nested := range value {
+				if key != "modules" && key != "Modules" {
+					visit(nested)
+				}
+			}
+		}
+	}
+	visit(root)
+	sort.Slice(result, func(i, j int) bool { return result[i].ModuleKey < result[j].ModuleKey })
+	return result, nil
+}
+
+func firstJSONString(value map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if item, ok := value[key].(string); ok {
+			return item
+		}
+	}
+	return ""
 }
 
 func parseProviders(content string) []domain.ProviderSelection {

@@ -33,6 +33,7 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 	git(t, fixture, "add", ".")
 	git(t, fixture, "commit", "-m", "fixture")
 	config := runtime.DefaultConfig()
+	config.AllowLocalGit = true
 	config.DataDir = t.TempDir()
 	config.DatabasePath = filepath.Join(config.DataDir, "unused.db")
 	config.ArtifactDir = filepath.Join(config.DataDir, "unused-artifacts")
