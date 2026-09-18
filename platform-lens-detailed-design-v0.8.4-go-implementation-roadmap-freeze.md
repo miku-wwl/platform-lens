@@ -1,4 +1,4 @@
-# PlatformLens — Detailed Design v0.8.4 FINAL IMPLEMENTATION ROADMAP FREEZE
+# PlatformLens — Detailed Design v0.8.4 GO IMPLEMENTATION ROADMAP FREEZE
 
 ## 1. Overview
 
@@ -149,6 +149,92 @@ Manifest Commit
    ↓
 COMPLETED
 ```
+
+---
+
+
+## 3.1 Go Implementation Baseline
+
+PlatformLens V1 使用 Go 实现。
+
+推荐仓库结构：
+
+```text
+platform-lens/
+├── cmd/
+│   └── platformlens/
+│       └── main.go
+├── internal/
+│   ├── api/
+│   ├── source/
+│   ├── runs/
+│   ├── execution/
+│   ├── discovery/
+│   ├── validation/
+│   │   ├── terraform/
+│   │   └── kubernetes/
+│   ├── evidence/
+│   ├── review/
+│   ├── evaluation/
+│   ├── storage/
+│   ├── report/
+│   └── runtime/
+├── infra/
+├── fixtures/
+├── tests/
+├── toolchain.lock
+├── go.mod
+├── go.sum
+└── README.md
+```
+
+实现原则：
+
+```text
+one Go service / binary
+package boundaries follow architecture boundaries
+internal/ for non-public implementation
+strong typed structs for persisted/API schemas
+interfaces only at real substitution boundaries
+```
+
+核心 Go mapping：
+
+```text
+cancellation / deadline
+→ context.Context
+
+heartbeat / worker concurrency
+→ goroutines + context cancellation
+
+local synchronization
+→ sync.Mutex / sync.RWMutex / sync.Once as appropriate
+
+external commands
+→ os/exec via CommandRunner
+
+HTTP API
+→ net/http
+
+structured logging
+→ log/slog
+
+SQLite
+→ database/sql + pinned SQLite driver
+
+DynamoDB / S3
+→ AWS SDK for Go v2
+
+clock abstraction
+→ Clock interface
+
+JSON schemas
+→ typed Go structs + explicit validation
+```
+
+Git / Terraform / TFLint / Kubeconform 保持为外部 CLI，不为了“纯 Go”改写它们的真实 CLI semantics。
+
+Go implementation 不改变任何 frozen architecture invariant。
 
 ---
 
@@ -692,10 +778,32 @@ SourceExcerpt.file
 artifact-relative source locator
 ```
 
-```python
-root = workspace_root.resolve()
-candidate = (root / relative_path).resolve()
-candidate.relative_to(root)
+```go
+func ResolveExistingWithin(root, relative string) (string, error) {
+    if filepath.IsAbs(relative) {
+        return "", ErrPathOutsideWorkspace
+    }
+
+    rootAbs, err := filepath.Abs(root)
+    if err != nil {
+        return "", err
+    }
+
+    candidate := filepath.Join(rootAbs, filepath.Clean(relative))
+    candidate, err = filepath.EvalSymlinks(candidate)
+    if err != nil {
+        return "", err
+    }
+
+    rel, err := filepath.Rel(rootAbs, candidate)
+    if err != nil ||
+        rel == ".." ||
+        strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+        return "", ErrPathOutsideWorkspace
+    }
+
+    return candidate, nil
+}
 ```
 
 拒绝：
@@ -706,6 +814,9 @@ absolute outside path
 symlink escape
 prefix confusion
 ```
+
+对于必须存在的 repository/tool 输入路径，使用 `filepath.EvalSymlinks` 后再做 containment 检查。
+对于尚未创建的输出路径，先 confinement 已存在 parent directory，再由 PlatformLens 自己创建文件。
 
 ---
 
@@ -1153,6 +1264,7 @@ toolchain.lock
 固定：
 
 ```text
+Go build toolchain version
 terraform exact version (>=1.10)
 tflint exact version
 kubeconform exact version
@@ -1161,9 +1273,11 @@ kubeconform exact version
 Runtime：
 
 ```text
-actual != expected
+Terraform / TFLint / Kubeconform actual != expected
 → EXECUTION_ERROR
 ```
+
+Go toolchain version 在 build/CI 阶段 enforce，并写入 build provenance。
 
 除非显式 dev mode 允许 warning。
 
@@ -1181,32 +1295,65 @@ started_at
 completed_at
 ```
 
-通过 `Clock` 获取。
+通过 Go interface 获取：
 
-Tests 使用 `FakeClock`。
+```go
+type Clock interface {
+    Now() time.Time
+}
+
+type RealClock struct{}
+
+func (RealClock) Now() time.Time {
+    return time.Now().UTC()
+}
+```
+
+Tests 使用 deterministic `FakeClock`，禁止在 lease/reclaim 单元测试中直接依赖 wall clock。
 
 ---
 
 ## 44. CommandRunner
 
+Go `CommandRunner` 统一封装外部 CLI：
+
 ```text
 executable allowlist
 fixed argv
-isolated cwd
+confined cwd
 environment allowlist
 timeout
 stdout/stderr cap
 duration
-cancellation
+context cancellation
+process-tree cleanup
+```
+
+基础调用使用：
+
+```go
+cmd := exec.CommandContext(ctx, executable, args...)
+```
+
+但不能只依赖 `CommandContext` 的默认单进程 kill。
+
+必须提供 OS-specific process-tree implementation，例如：
+
+```text
+internal/execution/process_unix.go
+internal/execution/process_windows.go
 ```
 
 Timeout/cancel：
 
 ```text
-terminate process group/tree
-→ grace period
-→ force kill
+cancel context
+→ terminate process group/tree
+→ bounded grace period
+→ force kill remaining descendants
 ```
+
+这样 Terraform provider child processes 也必须被回收。
 
 ---
 
@@ -1274,13 +1421,32 @@ not a DLP guarantee
 
 ## 48. Reviewer Contract
 
-Reviewer 使用：
+Reviewer 使用 typed Go interface：
+
+```go
+type Reviewer interface {
+    Review(ctx context.Context, input ReviewInput) (ReviewResult, error)
+}
+```
+
+模型：
 
 ```text
 structured input
-structured output
-schema validation
+typed Go structs
+structured JSON output
+explicit schema/field validation
 ```
+
+Required CI 实现：
+
+```go
+type DeterministicFakeReviewer struct {
+    // fixed deterministic behavior for tests
+}
+```
+
+Live provider 作为独立 adapter，实现相同 `Reviewer` interface。
 
 Rules：
 
@@ -1301,6 +1467,8 @@ max 1–2
 ---
 
 ## 49. Deterministic Evaluator
+
+Go deterministic evaluator 应保持纯函数/近纯函数风格，优先使用 typed structs，不依赖网络。
 
 **永远先于 semantic evaluator 执行。**
 
@@ -1325,6 +1493,16 @@ UNSUPPORTED
 ---
 
 ## 50. Semantic Evaluator
+
+接口：
+
+```go
+type SemanticEvaluator interface {
+    Evaluate(ctx context.Context, input EvaluationInput) (EvaluationResult, error)
+}
+```
+
+Required CI 使用 deterministic fake implementation；live model adapter 不得成为 required test dependency。
 
 只接收 structural checks passed 的 finding。
 
@@ -1413,26 +1591,43 @@ no insignificant whitespace
 LF line ending where textual newline exists
 ```
 
-Equivalent implementation：
+Go implementation：
 
-```python
-json.dumps(
-    manifest,
-    sort_keys=True,
-    separators=(",", ":"),
-    ensure_ascii=False,
-)
+1. Manifest 使用 typed Go structs。
+2. 所有具有 set semantics 的 slices 在 marshal 前 deterministic sort。
+3. map keys 必须使用 deterministic JSON encoding。
+4. 使用同一份 bytes 进行 write + SHA256。
+
+```go
+canonicalizeManifest(manifest)
+
+b, err := json.Marshal(manifest)
+if err != nil {
+    return err
+}
+
+sum := sha256.Sum256(b)
+
+if err := os.WriteFile(path, b, 0o600); err != nil {
+    return err
+}
 ```
 
-Then：
+`encoding/json` 输出的 exact `b` 就是 authoritative manifest bytes。
+
+禁止：
 
 ```text
-UTF-8 encode exact string
-→ write exact bytes
-→ SHA256 exact same bytes
+marshal once for hash
+pretty-print again for file
 ```
 
-不要重新 pretty-print 后再 hash。
+必须：
+
+```text
+same bytes → file
+same bytes → SHA256
+```
 
 ---
 
@@ -1450,7 +1645,10 @@ source
 result
 
 toolchain:
-  expected + actual versions
+  go_build_version
+  terraform expected + actual version
+  tflint expected + actual version
+  kubeconform expected + actual version
   toolchain_lock_hash
 
 config:
@@ -1497,6 +1695,18 @@ write deterministic artifacts
 
 ## 56. SQLite
 
+Go persistence layer 使用：
+
+```text
+database/sql
++
+pinned SQLite driver
+```
+
+优先保持跨平台可重复构建；driver 选择必须在 `go.mod` 中 pin。
+
+Database contract：
+
 ```text
 WAL
 busy_timeout
@@ -1514,11 +1724,27 @@ complete
 fail
 ```
 
+Go repository methods 必须通过 context-aware DB APIs：
+
+```go
+QueryContext
+ExecContext
+BeginTx
+```
+
 所有操作遵循 RunRepository CAS contract。
 
 ---
 
 ## 57. DynamoDB
+
+Go backend 使用：
+
+```text
+AWS SDK for Go v2
+```
+
+LocalStack Stage 1 与 Real AWS Stage 2 必须复用同一个 repository implementation，仅通过 AWS config / endpoint 配置切换。
 
 GSI：
 
@@ -1541,9 +1767,17 @@ expected_lease_expires_at
 expected_state
 ```
 
+Conditional-check failure 必须映射为 domain-level ownership/CAS failure，而不是 generic system error。
+
 ---
 
 ## 58. API
+
+V1 HTTP server 使用 Go `net/http`。
+
+除非 routing complexity 明确需要，否则不引入大型 Web framework。
+
+Endpoints：
 
 ```text
 POST /analysis
@@ -1551,6 +1785,21 @@ GET /analysis/{run_id}
 GET /healthz
 GET /readyz
 GET /version
+```
+
+Handlers：
+
+```text
+thin HTTP layer
+→ validate/decode
+→ call application service
+→ encode typed response
+```
+
+所有 request-scoped work 传播：
+
+```go
+r.Context()
 ```
 
 `/readyz`：
@@ -1569,12 +1818,23 @@ version
 git_commit
 build_id
 image_tag
+go_version
 toolchain_lock_hash
 ```
+
+Build metadata 可通过 Go linker flags 注入，例如 `-ldflags -X`，Go runtime version 使用 `runtime.Version()`。
 
 ---
 
 ## 59. Structured Logging
+
+使用 Go 标准库：
+
+```text
+log/slog
+```
+
+日志必须 structured，不以拼接字符串代替结构字段。
 
 关键字段：
 
@@ -1643,6 +1903,18 @@ Git fixture
 
 Required CI 不调用真实 LLM。
 
+
+Go required checks：
+
+```text
+go fmt
+go vet ./...
+go test ./...
+go test -race ./...   # where supported by the CI platform
+```
+
+项目可额外配置 staticcheck/golangci-lint，但不得把非必要 lint framework 变成架构依赖。
+
 真实模型：
 
 ```text
@@ -1698,6 +1970,16 @@ same canonical ordering
 ```text
 complete/fail
 → all lease fields NULL
+```
+
+### Go runtime / concurrency
+
+```text
+context cancellation propagates
+heartbeat goroutine terminates
+no goroutine leak after completed/failed Run
+process-tree cancellation works on target OS
+go test -race passes where supported
 ```
 
 ### Existing suites
@@ -1816,13 +2098,17 @@ Reference-Driven Code Polish
 #### Stage 1A — Foundation
 
 ```text
-models
-Clock
+go.mod / go.sum
+cmd/platformlens
+internal package skeleton
+typed models
+Clock interface / FakeClock
 config
 toolchain.lock
-logging
-health/readiness/version
+log/slog
+net/http health/readiness/version
 CommandRunner
+context cancellation
 limits
 ```
 
@@ -1890,8 +2176,10 @@ DeterministicFakeEvaluator
 #### Stage 1F — LocalStack AWS-Compatible Backend
 
 ```text
+AWS SDK for Go v2
 DynamoDB RunRepository
 S3 ArtifactStorage
+shared LocalStack/Real-AWS client configuration
 Terraform LocalStack infrastructure
 conditional-write contract tests
 orphan artifact tests
@@ -2030,7 +2318,7 @@ Stage 3 review dimensions：
 
 ```text
 module boundaries
-class/function responsibility
+package/type/function responsibility
 naming consistency
 error taxonomy
 logging consistency
@@ -2091,7 +2379,6 @@ no invariant regression
 ---
 
 ## 65. Final Invariants
-## 65. Final Invariants
 
 > **1. A Run pins one verified commit OID at most once.**  
 > **2. Every Run mutation is guarded by explicit conditional ownership/state checks.**  
@@ -2104,4 +2391,4 @@ no invariant regression
 > **9. Deterministic evidence validation always precedes semantic evaluation.**  
 > **10. Required CI E2E remains deterministic and does not depend on a live LLM.**
 
-> **No further architecture work is required before implementation.**
+> **No further architecture work is required before Go implementation.**

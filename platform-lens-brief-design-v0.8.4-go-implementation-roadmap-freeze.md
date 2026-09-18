@@ -1,4 +1,4 @@
-# PlatformLens — Brief Design v0.8.4 FINAL IMPLEMENTATION ROADMAP FREEZE
+# PlatformLens — Brief Design v0.8.4 GO IMPLEMENTATION ROADMAP FREEZE
 
 ## 1. 项目定位
 
@@ -33,6 +33,39 @@ Manifest-Committed Result
 核心原则：
 
 > **Immutable source. Deterministic facts. Fenced recovery. Evidence-backed AI. Auditable results.**
+
+---
+
+
+## 1.1 Go Implementation Baseline
+
+V1 implementation language：
+
+```text
+Go
+```
+
+实现形态：
+
+```text
+single Go service / binary
+cmd/platformlens
+internal/*
+```
+
+核心 Go primitives：
+
+```text
+context.Context
+goroutine / sync
+os/exec
+database/sql
+net/http
+log/slog
+AWS SDK for Go v2
+```
+
+Git / Terraform / TFLint / Kubeconform 继续作为外部 CLI，由统一 `CommandRunner` 调用。
 
 ---
 
@@ -233,12 +266,17 @@ Manifest 不 hash 自己。
 V1 包含：
 
 ```text
-Clock abstraction
+Go Clock interface + FakeClock
+context-based cancellation
+goroutine heartbeat
+os/exec CommandRunner
+database/sql
+net/http API
+log/slog structured logging
+AWS SDK for Go v2
 toolchain.lock enforcement
-structured logging
 resource limits
 health/readiness/version
-heartbeat + cancellation
 workspace sweeper
 ```
 
@@ -369,4 +407,4 @@ hostile-repository sandbox
 LangGraph
 ```
 
-> **This design is frozen for implementation.**
+> **This Go implementation design is frozen for implementation.**
