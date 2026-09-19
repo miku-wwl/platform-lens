@@ -1,4 +1,4 @@
-# PlatformLens — Detailed Design v0.8.5 GO LOCALSTACK-HEAVY ROADMAP FREEZE
+# PlatformLens — Detailed Design v0.8.7 GO + WEB CONSOLE FINAL DELIVERY ROADMAP FREEZE
 
 ## 1. Overview
 
@@ -110,7 +110,13 @@ Stage 1
 → prove application/cloud contracts locally as far as practical
 
 Stage 2
-→ validate only the remaining real-AWS differences
+→ polish the frozen backend implementation without changing behavior
+
+Stage 2.5
+→ add a lightweight Web Console over stable APIs
+
+Stage 3
+→ validate only the remaining real-AWS differences using the final backend + frontend
 ```
 
 LocalStack 负责尽可能验证：
@@ -134,7 +140,7 @@ proof of real AWS quota behavior
 proof of real regional failure behavior
 ```
 
-这些现实差异只在薄 Stage 2 做 smoke validation。
+这些现实差异只在薄 Stage 3 做 final smoke validation；Stage 2.5 只增加 presentation layer，不替代真实 AWS 验证。
 
 ---
 
@@ -271,6 +277,138 @@ JSON schemas
 Git / Terraform / TFLint / Kubeconform 保持为外部 CLI，不为了“纯 Go”改写它们的真实 CLI semantics。
 
 Go implementation 不改变任何 frozen architecture invariant。
+
+### 3.2 Web Console Baseline
+
+Stage 2.5 增加独立的轻量 Web Console：
+
+```text
+web/
+├── src/
+│   ├── api/
+│   ├── components/
+│   ├── features/
+│   │   ├── runs/
+│   │   ├── analysis/
+│   │   └── evidence/
+│   ├── pages/
+│   ├── types/
+│   └── main.tsx
+├── package.json
+├── tsconfig.json
+└── vite.config.ts
+```
+
+推荐技术栈：
+
+```text
+React
+TypeScript
+Vite
+```
+
+默认不引入：
+
+```text
+Next.js
+SSR
+GraphQL
+micro-frontend
+BFF
+frontend-owned business workflow
+```
+
+Web Console 只通过 PlatformLens HTTP API 工作：
+
+```text
+Browser
+→ React Web Console
+→ Go HTTP API
+→ Application Service
+→ RunRepository / ArtifactStorage
+```
+
+前端不得直接访问 DynamoDB、S3、SQLite、Filesystem 或 workspace。
+
+---
+
+### 3.3 Web Console UX Boundary
+
+Stage 2.5 的目标不是把 PlatformLens 改造成大而全 SaaS，而是提供 operator/demo surface。
+
+核心页面：
+
+```text
+Dashboard
+New Analysis
+Runs
+Run Detail
+```
+
+`New Analysis`：
+
+```text
+repository_url
+requested_ref
+optional requested_path
+```
+
+`Runs`：
+
+```text
+run_id
+state
+attempt_no
+repository
+requested_ref
+commit_oid?
+analysis_outcome?
+coverage_status?
+updated_at
+```
+
+`Run Detail` 至少展示：
+
+```text
+Source Identity
+Lifecycle Timeline
+Attempt History
+Validation Results
+Diagnostics
+Evidence
+AI Findings
+Evaluation
+Terraform Provenance
+Kubernetes Results
+Artifacts
+Report
+Manifest
+```
+
+状态可视化：
+
+```text
+QUEUED
+→ CLAIMED
+→ RETRIEVING
+→ VALIDATING
+→ REVIEWING
+→ EVALUATING
+→ PERSISTING
+→ COMPLETED / FAILED
+```
+
+Recovery 可视化：
+
+```text
+Attempt 1
+CLAIMED → ... → worker lost
+
+Attempt 2
+CLAIMED → replay pinned commit → ... → COMPLETED
+```
+
+前端显示的数据必须来自后端 authoritative state / artifacts，不得自行推导另一个 lifecycle truth。
 
 ---
 
@@ -1832,7 +1970,7 @@ Go backend 使用：
 AWS SDK for Go v2
 ```
 
-LocalStack Stage 1 与 Real AWS Stage 2 必须复用同一个 repository implementation，仅通过 AWS config / endpoint 配置切换。
+LocalStack Stage 1 与 Real AWS Stage 3 必须复用同一个 repository implementation，仅通过 AWS config / endpoint 配置切换。Stage 2 只允许 behavior-preserving code polish。
 
 GSI：
 
@@ -1861,7 +1999,7 @@ Conditional-check failure 必须映射为 domain-level ownership/CAS failure，�
 
 ## 57.1 Shared AWS Runtime Contract
 
-LocalStack Stage 1 与 Real AWS Stage 2 必须使用 **同一套 AWS SDK for Go v2 client implementation**。
+LocalStack Stage 1 与 Real AWS Stage 3 必须使用 **同一套 AWS SDK for Go v2 client implementation**。Stage 2 不得创建另一套 AWS runtime implementation。
 
 Backend selection 与 endpoint override 必须分离：
 
@@ -1969,7 +2107,7 @@ Readiness failure 不得触发资源创建。
 
 ```text
 least-privilege worker should not require infrastructure-admin permissions
-Stage 1 LocalStack and Stage 2 AWS use the same runtime permission boundary
+Stage 1 LocalStack and Stage 3 AWS use the same runtime permission boundary
 ```
 
 Terraform ownership：
@@ -1978,7 +2116,7 @@ Terraform ownership：
 infra/localstack/
 → LocalStack DynamoDB / S3 / IAM test principal
 
-infra/aws/   # Stage 2 only
+infra/aws/   # Stage 3 only
 → ephemeral real-AWS resources
 ```
 
@@ -2235,6 +2373,25 @@ GET /readyz
 GET /version
 ```
 
+Stage 2.5 为 Web Console 允许增加 presentation/read endpoints：
+
+```text
+GET /analysis
+GET /analysis/{run_id}/artifacts
+GET /analysis/{run_id}/report
+```
+
+如果实现需要，可增加：
+
+```text
+pagination
+state filter
+repository filter
+bounded sorting
+```
+
+这些 endpoint 只能暴露已有 authoritative data，不得创建新的 lifecycle semantics。
+
 Handlers：
 
 ```text
@@ -2242,6 +2399,18 @@ thin HTTP layer
 → validate/decode
 → call application service
 → encode typed response
+```
+
+Web Console API contract：
+
+```text
+frontend DTO may differ from persistence model
+but backend remains source of truth
+
+no frontend direct DB/storage access
+no business rule duplication in React
+no client-side reconstruction of authoritative state
+bounded artifact/report reads only
 ```
 
 所有 request-scoped work 传播：
@@ -2365,7 +2534,7 @@ Terraform provision LocalStack resources
 → S3 manifest read-back/hash verification
 ```
 
-LocalStack gate 使用和 Stage 2 相同的：
+LocalStack gate 使用和最终 Stage 3 相同的：
 
 ```text
 AWS SDK implementation
@@ -2423,7 +2592,7 @@ real quotas
 real service latency distribution
 ```
 
-这些在 Stage 2 只做最小 smoke validation。
+这些在 Stage 3 只做最小 final smoke validation。
 
 ---
 
@@ -2513,14 +2682,24 @@ normal E2E succeeds under enforcement
 ### LocalStack resilience
 
 ```text
-DynamoDB throttling / 5xx
-S3 PutObject 5xx
-network latency
+AWS SDK deterministic fault classification
 renewal transient failure
 bounded retry
 no false completion
 eventual reclaim
+manifest write failure semantics
 ```
+
+如果当前 LocalStack Ultimate 环境提供可用 chaos/fault injector，则额外执行：
+
+```text
+DynamoDB throttling / 5xx
+S3 PutObject 5xx
+network latency
+temporary outage
+```
+
+若该 capability 未配置/不可用，可记录为 `BLOCKED — capability`；只要 deterministic fault contract、race、IAM、multi-process 与 process-kill acceptance 全部 PASS，不阻止 Stage 1 freeze。
 
 ### Multi-process worker
 
@@ -2549,7 +2728,7 @@ live TFLint/Kubeconform
 
 ## 63. Scope Freeze
 
-v0.8.5 不改变 PlatformLens 产品目标；只把更多 **cloud verification responsibility** 从 Stage 2 前移到 Stage 1。
+v0.8.7 不改变 PlatformLens 核心后端架构；Stage 1 已完成厚 LocalStack 验证，Stage 2 做 reference-driven behavior-preserving polish，Stage 2.5 明确新增轻量 Web Console presentation layer，Stage 3 执行薄 Real AWS final validation。
 
 V1 / Stage 1 包含：
 
@@ -2633,77 +2812,94 @@ LangGraph
 real-AWS load testing
 real-AWS chaos campaign
 always-on AWS compute
+large multi-tenant SaaS control plane
+frontend direct AWS/database access
 production autoscaling platform
 ```
 
 ---
 
-## 64. Three-Stage Delivery Strategy
+## 64. Final Delivery Strategy
 
-PlatformLens 的核心架构在三个阶段保持不变，但 v0.8.5 将 Stage 1 做厚、Stage 2 压薄。
+PlatformLens 的核心架构与 frozen invariants 在所有阶段保持不变。
+
+v0.8.7 的最终顺序：
 
 ```text
 Stage 1
 Thick LocalStack Ultimate
-Build + Prove + Cloud Resilience
+Build + Prove
+PASS / FREEZE
         ↓
 Stage 2
-Thin Real AWS Smoke
-Reality Check Only
+Reference-Driven Code Polish
+Behavior-Preserving Refactor
+Full Regression
+RE-FREEZE
+        ↓
+Stage 2.5
+Web Console / Operator UX
+Presentation Layer
+UI Acceptance
+FREEZE
         ↓
 Stage 3
-Reference-Driven Code Polish
+Thin Real AWS Final Validation
+Reality Check on Final Product
 ```
-
-三个阶段不是三个不同产品，也不是三次重写。
 
 ---
 
 ### 64.0 Current Implementation Baseline — 2026-09-19
 
-当前代码已完成：
+Stage 1 已完成并正式冻结。
+
+已验证：
 
 ```text
-Go core implementation
-Git pin/replay
-SQLite/DynamoDB CAS
-Filesystem/S3
-Terraform/TFLint/Kubeconform
-Evidence/AI/Manifest
-LocalStack DynamoDB/S3 E2E
-LocalStack lifecycle concurrency
-live TFLint
-live Kubeconform
+Go core implementation                 PASS
+Git pin/replay                         PASS
+SQLite/DynamoDB CAS                    PASS
+Filesystem/S3                          PASS
+Terraform/TFLint/Kubeconform           PASS
+Evidence/AI/Manifest                   PASS
+AWS runtime contract                   PASS
+LocalStack IAM enforcement             PASS
+LocalStack DynamoDB/S3 E2E             PASS
+LocalStack lifecycle concurrency       PASS
+go test ./...                          PASS
+go test -race ./...                    PASS
+live TFLint                            PASS
+live Kubeconform                       PASS
+2-process / 20-run acceptance          PASS
+real process-kill reclaim/replay       PASS
+manifest read-back/hash verification   PASS
 ```
 
-当前 acceptance：
+LocalStack chaos/fault injector：
 
 ```text
-go vet ./...           PASS
-go test ./...          PASS
-TFLint live            PASS
-Kubeconform live       PASS
-SQLite E2E             PASS
-LocalStack E2E         PASS
-LocalStack CAS         PASS
-go test -race ./...    BLOCKED by local CGO/C compiler environment
+BLOCKED — current environment capability not configured
 ```
 
-v0.8.5 后续工作不重新实现 Stage 1A–1G，而是增加 cloud-runtime hardening 与 Ultimate acceptance。
+但 deterministic failure contract 已验证，因此：
+
+```text
+Stage 1 = PASS / FREEZE
+```
 
 ---
 
-### 64.1 Stage 1 — Thick LocalStack Ultimate / Local-First
+### 64.1 Stage 1 — Thick LocalStack Ultimate / Build & Prove
 
-目标：
+Stage 1 职责已经完成：
 
-> **不上真实 AWS，也尽可能把 PlatformLens 的产品逻辑、AWS-compatible contract、least-privilege、failure handling、multi-worker recovery 全部验证完成。**
+> **不上真实 AWS，也尽可能把 PlatformLens 的产品逻辑、AWS-compatible contract、least privilege、concurrency、recovery、manifest authority 和 multi-worker behavior 验证完成。**
 
-#### Stage 1A–1G — Existing Core
-
-继续保持：
+包含：
 
 ```text
+Stage 1A–1G
 Foundation
 Git Source
 Run Lifecycle
@@ -2711,105 +2907,95 @@ Deterministic Analysis
 AI Layer
 DynamoDB/S3 LocalStack Backend
 Local Failure/E2E
+
+Stage 1H
+AWS Runtime Contract Hardening
+
+Stage 1I
+LocalStack IAM / Resilience / Multi-Worker Acceptance
+
+Stage 1J
+Final Local Freeze Gate
 ```
 
-这些部分只有 regression，不重新设计。
+后续不再扩大 Stage 1 核心后端 scope。
 
-#### Stage 1H — AWS Runtime Contract Hardening
+---
 
-实现：
+### 64.2 Stage 2 — Reference-Driven Code Polish / Re-Freeze
+
+Stage 2 在不改变产品行为的前提下，对真实后端代码做工程质量提升。
+
+参考四个仓：
 
 ```text
-explicit backend mode independent from endpoint override
-shared AWS SDK for Go v2 configuration
-no hard-coded test credentials in production clients
-explicit bounded retry policy
-precise AWS error classification
-Terraform-only cloud provisioning
-side-effect-free runtime client construction/readiness
-repository + artifact + worker readiness
-canonical S3 manifest URI
-S3 read-back/hash verification
+ANZ golden-retriever
+CBA project-echo
+CBA architect-agent
+ANZ pkg
 ```
 
-特别修复当前代码边界：
+参考职责：
 
 ```text
-AWSEndpointURL must not be the backend selector
-Dynamo/S3 constructors must not auto-create resources
-LocalStack endpoint must not imply hard-coded root/test credentials
-S3 Exists must not swallow AccessDenied/5xx as "not found"
-/readyz must include repository + artifacts + worker acceptance
+golden-retriever
+→ Git abstraction / synchronization
+
+project-echo
+→ lifecycle / persistence / recovery / cleanup
+
+architect-agent
+→ reviewer / evaluator / structured AI
+
+ANZ pkg
+→ Clock / config / logging / health / runtime hygiene
 ```
 
-Heartbeat：
+允许：
 
 ```text
-CAS/fencing failure → immediate cancel
-transient cloud failure → bounded retry within lease safety window
-renewal cannot be confirmed safely → cancel local authority, allow reclaim
+package/module boundary cleanup
+naming consistency
+error taxonomy
+logging consistency
+configuration ownership
+concurrency/recovery readability
+resource cleanup
+duplicate-code reduction
+test readability
+fixture quality
+comments/documentation
 ```
 
-#### Stage 1I — LocalStack IAM / Resilience / Multi-Worker Acceptance
-
-IAM：
+禁止：
 
 ```text
-LocalStack IAM enforcement
-dedicated worker principal
-least-privilege policy
-positive permission tests
-negative admin/provisioning tests
-full PlatformLens E2E under restricted credentials
+new backend product feature
+new AWS service
+architecture redesign
+workflow engine replacement
+frozen invariant changes for stylistic reasons
+mechanical source copying
 ```
 
-Fault / latency：
+每批 risky refactor：
 
 ```text
-DynamoDB throttling
-DynamoDB 500/503
-S3 PutObject 500/503
-network latency
-temporary outage
+characterization test
+→ small change
+→ focused test
+→ full regression periodically
 ```
 
-验证：
+Stage 2 输出：
 
 ```text
-bounded retry
-heartbeat independence
-no state/lease regression
-no false COMPLETED
-eventual reclaim after outage
-manifest authority
+STAGE2-REFERENCE-COMPARISON-REPORT.md
+STAGE2-REFACTOR-PLAN.md
+STAGE2-RE-FREEZE-REPORT.md
 ```
 
-Multi-worker：
-
-```text
-2+ independent OS processes
-20+ fixture Runs
-same LocalStack DynamoDB/S3
-unique worker IDs
-exactly-one authoritative winner
-```
-
-Crash scenario：
-
-```text
-worker A claim/pin
-→ kill worker A process
-→ lease expires
-→ worker B reclaim
-→ replay pinned commit
-→ winning_attempt increments
-→ manifest from winner
-→ COMPLETED
-```
-
-#### Stage 1J — Final Local Freeze Gate
-
-必须重新执行：
+Stage 2 Re-Freeze Gate：
 
 ```text
 go fmt ./...
@@ -2820,65 +3006,357 @@ go test -race ./...
 live TFLint
 live Kubeconform
 
-SQLite E2E
+SQLite/Filesystem E2E
 LocalStack DynamoDB/S3 E2E
-LocalStack IAM E2E
-LocalStack fault/latency suite
-multi-process suite
+LocalStack IAM restricted E2E
+DynamoDB atomic lifecycle/CAS
+Git pin/replay
+heartbeat/reclaim
+multi-process 20+ runs
 real process-kill reclaim/replay
-manifest read-back verification
+manifest read-back/hash
+Terraform provenance
 ```
 
-Stage 1 完成条件：
+全部 PASS 后：
 
 ```text
-core contracts PASS
-race detector PASS
-live validators PASS
-LocalStack cloud gate PASS
-no real AWS required
+Stage 2 = PASS / RE-FREEZE
 ```
-
-如果仅因外部环境无法执行某个 required gate：
-
-```text
-PARTIAL — environment verification only
-```
-
-如果存在代码 correctness failure：
-
-```text
-FAIL / PARTIAL — implementation
-```
-
-不得混淆两者。
 
 ---
 
-### 64.2 Stage 2 — Thin Real AWS Smoke Validation
+### 64.3 Stage 2.5 — Web Console / Operator UX
 
-Stage 2 是 **短生命周期 reality check**，不是开发阶段。
+Stage 2.5 新增轻量 Web Console，使 PlatformLens 的运行状态、证据链和恢复过程可观察、可演示。
+
+目标：
+
+> **为已经稳定的 PlatformLens backend 增加 presentation layer，而不是重写业务逻辑。**
+
+技术栈：
+
+```text
+React
+TypeScript
+Vite
+```
+
+默认架构：
+
+```text
+Browser
+  ↓
+React Web Console
+  ↓
+PlatformLens Go HTTP API
+  ↓
+Application Service
+  ↓
+RunRepository / ArtifactStorage
+```
+
+前端不得直连：
+
+```text
+DynamoDB
+S3
+SQLite
+Filesystem
+workspace
+```
+
+核心页面：
+
+```text
+Dashboard
+New Analysis
+Runs
+Run Detail
+```
+
+#### 64.3.1 Dashboard
+
+显示：
+
+```text
+recent runs
+state counts
+completed/failed summary
+recent recovery/reclaim events
+backend/ready/version summary
+```
+
+Dashboard 只做 presentation，不引入新的 analytics data store。
+
+#### 64.3.2 New Analysis
+
+输入：
+
+```text
+repository_url
+requested_ref
+requested_path?
+```
+
+提交：
+
+```text
+POST /analysis
+```
+
+成功后跳转 Run Detail。
+
+#### 64.3.3 Runs
+
+允许：
+
+```text
+pagination
+bounded state filter
+repository filter
+updated-time sort
+```
+
+推荐 backend endpoint：
+
+```text
+GET /analysis
+```
+
+不得通过前端自己扫描 artifact storage 构建 runs 列表。
+
+#### 64.3.4 Run Detail
+
+至少展示：
+
+```text
+Run ID
+state
+attempt_no
+winning_attempt
+lease/worker summary when active
+
+Source Identity:
+repository_url
+requested_ref
+resolved_ref
+ref_type
+commit_oid
+
+Validation:
+Terraform
+TFLint
+Kubeconform
+coverage
+analysis outcome
+
+Diagnostics
+Evidence
+AI Findings
+Evaluation
+Terraform dependency provenance
+Kubernetes resource results
+Artifacts
+Report
+Manifest
+```
+
+Lifecycle timeline：
+
+```text
+QUEUED
+→ CLAIMED
+→ RETRIEVING
+→ VALIDATING
+→ REVIEWING
+→ EVALUATING
+→ PERSISTING
+→ COMPLETED / FAILED
+```
+
+Attempt / recovery timeline：
+
+```text
+Attempt 1
+→ worker lost / lease expired
+
+Attempt 2
+→ reclaim
+→ replay pinned commit
+→ COMPLETED
+```
+
+如果当前 persistence model 不保存足够完整的历史事件，UI 不得虚构历史。
+
+允许两种实现：
+
+```text
+1. 只展示现有 authoritative current/final state
+2. 增加 bounded audit/read model
+```
+
+若选择 2，必须保持：
+
+```text
+audit data is observational
+not authoritative for claim/lease/fencing
+```
+
+且不得改变 RunRepository safety contract。
+
+#### 64.3.5 Read/Presentation APIs
+
+Stage 2.5 允许增加：
+
+```text
+GET /analysis
+GET /analysis/{run_id}/artifacts
+GET /analysis/{run_id}/report
+```
+
+必要时增加 typed frontend DTO。
+
+必须：
+
+```text
+bounded responses
+safe path/artifact lookup
+redaction preserved
+no secret leakage
+no raw credential-bearing URL
+no arbitrary filesystem read
+```
+
+#### 64.3.6 Frontend Error/State Handling
+
+前端至少区分：
+
+```text
+loading
+empty
+active
+completed
+failed
+backend unavailable
+artifact unavailable
+review unavailable
+evaluation unavailable
+```
+
+不得把：
+
+```text
+AI unavailable
+```
+
+显示为：
+
+```text
+Run failed
+```
+
+如果 deterministic run 已 COMPLETED。
+
+#### 64.3.7 Stage 2.5 Acceptance
+
+Frontend：
+
+```text
+npm/pnpm install with lockfile
+typecheck PASS
+unit/component tests PASS
+production build PASS
+```
+
+Backend regression：
+
+```text
+go vet PASS
+go test PASS
+go test -race PASS
+```
+
+Functional UI acceptance：
+
+```text
+submit analysis from UI PASS
+observe active lifecycle PASS
+view completed result PASS
+view diagnostics PASS
+view evidence PASS
+view AI findings/evaluation PASS
+view Terraform provenance PASS
+view Kubernetes results PASS
+view report PASS
+view manifest PASS
+failed-run rendering PASS
+AI-unavailable rendering PASS
+```
+
+LocalStack demo：
+
+```text
+Web Console
+→ Go backend
+→ LocalStack DynamoDB/S3
+→ full analysis
+→ COMPLETED
+→ UI renders authoritative result
+```
+
+Stage 2.5 输出：
+
+```text
+STAGE2.5-WEB-CONSOLE-ACCEPTANCE-REPORT.md
+```
+
+Completion criteria：
+
+```text
+frontend build/test PASS
+UI E2E PASS
+backend regression PASS
+no frozen invariant regression
+no direct cloud/database access from frontend
+```
+
+成功后：
+
+```text
+Stage 2.5 = PASS / FREEZE
+```
+
+---
+
+### 64.4 Stage 3 — Thin Real AWS Final Validation
+
+Stage 3 使用 **Stage 2.5 freeze 后的最终 backend + frontend**。
+
+不重新开发 PlatformLens。
 
 保持：
 
 ```text
-same Go binary
+same Stage 2.5 frozen Go backend
 same AWS SDK client implementation
 same DynamoDB repository
 same S3 storage
 same IAM policy intent
 same state machine
 same evidence/manifest schemas
+same Web Console
 ```
 
-默认执行方式：
+默认：
 
 ```text
-local PlatformLens worker(s)
+local Go worker(s)
++ local Web Console
 → real AWS public endpoints
 ```
 
-因此不要求购买或长期运行：
+因此默认不要求：
 
 ```text
 EC2
@@ -2895,13 +3373,23 @@ Terraform 创建：
 DynamoDB table + GSI
 S3 artifact bucket
 least-privilege IAM principal/role
+basic CloudWatch resources if needed
 ```
 
-资源使用唯一 test prefix/name。
+#### AWS-02 IAM / Runtime Smoke
 
-#### AWS-02 Happy Path
+验证：
 
-只跑少量确定性 fixture：
+```text
+required runtime actions allowed
+CreateTable/CreateBucket/admin action denied
+real credential chain works
+TLS/network works
+```
+
+#### AWS-03 Happy Path
+
+运行极少量 deterministic fixture：
 
 ```text
 submit
@@ -2909,21 +3397,13 @@ submit
 → pin
 → validate
 → manifest to real S3
+→ read-back/hash
 → COMPLETED
 ```
 
-验证：
+#### AWS-04 Recovery Smoke
 
-```text
-real TLS/network
-real credential chain
-real DynamoDB conditional write
-real S3 read-back/hash
-```
-
-#### AWS-03 Recovery Smoke
-
-启动两个本地 worker 连接真实 AWS：
+两个本地 worker：
 
 ```text
 worker A claim/pin
@@ -2934,183 +3414,74 @@ worker A claim/pin
 → COMPLETED
 ```
 
-只需要 1 个 recovery case，不在 AWS 做大规模 chaos/load。
+只需要一个 recovery case。
 
-#### AWS-04 IAM Smoke
+#### AWS-05 Web Console Smoke
 
-验证：
-
-```text
-required worker actions allowed
-CreateTable/CreateBucket/admin action denied
-```
-
-Stage 1 已完成完整 IAM matrix；这里仅确认 real AWS 行为。
-
-#### AWS-05 GSI / Cost / Cleanup
-
-验证：
+至少执行一次：
 
 ```text
-GSI candidate discovery works
-base-table CAS remains authority
+Web Console
+→ submit Run
+→ backend uses real AWS
+→ Run completes
+→ UI shows final result/report/manifest
 ```
 
-不测量或宣称固定 GSI propagation SLA。
+目的只证明最终 presentation layer 能配合真实 AWS backend 工作，不做大规模 browser E2E matrix。
+
+#### AWS-06 GSI / CloudWatch / Cost
 
 记录：
 
 ```text
+GSI candidate discovery
+CloudWatch logs/metrics evidence
 resource list
-test duration
+validation duration
 approximate cost
 ```
 
-同一验证 session：
+#### AWS-07 Cleanup
+
+同一 validation session 结束：
 
 ```text
 terraform destroy
 ```
 
-Stage 2 明确不做：
+确认测试资源已清理。
 
-```text
-new product code
-large benchmark
-real-AWS chaos campaign
-long soak test
-EKS/ECS platform build
-production autoscaling
-architecture redesign
-```
-
-Stage 2 completion criteria：
+Stage 3 completion：
 
 ```text
 provision PASS
+IAM allow/deny PASS
 happy path PASS
 one recovery PASS
-IAM allow/deny PASS
+one UI-driven smoke PASS
 GSI/S3 smoke PASS
+CloudWatch evidence captured
+cost evidence captured
 destroy PASS
 ```
 
 原则：
 
-> **Stage 1 proves most behavior; Stage 2 only proves that the same behavior survives contact with real AWS.**
+> **Stage 1 proves correctness; Stage 2 polishes the backend; Stage 2.5 makes the system observable and demoable; Stage 3 validates the final product on real AWS.**
+
+如果 Stage 3 暴露真实 AWS 差异：
+
+```text
+minimal bugfix only
+→ rerun affected regression
+→ rerun affected Stage 3 smoke
+```
+
+不得借 Stage 3 扩大 scope。
 
 ---
 
-### 64.3 Stage 3 — Reference-Driven Code Polish
-
-Stage 3 只能在：
-
-```text
-Stage 1 local cloud freeze
-+
-Stage 2 real-AWS smoke validation
-```
-
-之后进行。
-
-目标：
-
-> **基于四个参考仓重新 review PlatformLens 的真实代码，让工程实现更清晰、更稳健、更接近成熟开源项目质量，但不改变已冻结产品范围。**
-
-参考仓职责：
-
-```text
-ANZ golden-retriever
-→ Git abstraction
-→ source/session/cache organization
-→ same-repo synchronization patterns
-
-CBA project-echo
-→ lifecycle
-→ conditional transition
-→ persistence
-→ stale recovery
-→ workspace/temp cleanup
-→ path/security hygiene
-
-CBA architect-agent
-→ reviewer/evaluator separation
-→ structured AI interfaces
-→ evaluation taxonomy
-→ prompt/module organization
-
-ANZ pkg
-→ Clock
-→ config
-→ logging
-→ health/readiness/version
-→ runtime/build hygiene
-```
-
-Stage 3 review dimensions：
-
-```text
-module boundaries
-package/type/function responsibility
-naming consistency
-error taxonomy
-logging consistency
-configuration ownership
-concurrency clarity
-resource cleanup
-test readability
-fixture quality
-duplicate code
-public/private API boundaries
-documentation/comments
-type/schema consistency
-```
-
-Stage 3 rules：
-
-```text
-NO new feature
-NO new infrastructure service
-NO architecture redesign
-NO change to frozen invariants unless implementation disproves one
-
-behavior-preserving refactor preferred
-tests before risky refactor
-small reviewable commits
-clean-room implementation
-respect repository licenses
-do not mechanically copy source
-```
-
-特别约束：
-
-```text
-golden-retriever ZIP license is not assumed
-→ concepts only unless licensing is separately verified
-```
-
-推荐 Stage 3 输出：
-
-```text
-reference-comparison-review.md
-refactor-plan.md
-before/after test report
-code-quality cleanup commits
-final architecture consistency check
-```
-
-Stage 3 completion criteria：
-
-```text
-all existing tests still pass
-LocalStack thick acceptance still passes
-real-AWS thin smoke still passes
-no scope growth
-no invariant regression
-```
-
-
----
 
 ## 65. Final Invariants
 
@@ -3129,4 +3500,4 @@ no invariant regression
 > **13. A Run cannot become COMPLETED until the authoritative manifest write is confirmed and its exact bytes are hashed.**  
 > **14. Transient cloud failures are distinguished from authoritative fencing loss and cannot silently produce false completion.**
 
-> **No further architecture redesign is required before the Stage 1 LocalStack-heavy implementation pass.**
+> **No further backend architecture redesign is required. Stage 1 is frozen; next work is Stage 2 reference-driven polish, Stage 2.5 Web Console, then Stage 3 thin Real AWS final validation.**
