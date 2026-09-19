@@ -3,16 +3,12 @@ package app
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
-	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/domain"
 	"github.com/miku-wwl/platform-lens/internal/evaluation"
 	"github.com/miku-wwl/platform-lens/internal/evidence"
@@ -154,36 +150,25 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		return fail("EXECUTION_ERROR", err)
 	}
 	outcome, coverage := Outcome(output.Results, s.Config.Limits)
-	prefix := storage.ArtifactURI(runID, run.AttemptNo, "")
-	artifacts := map[string][]byte{}
-	addJSON := func(name string, value any) error {
-		name = filepath.ToSlash(name)
-		data, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		artifacts[name] = data
-		_, err = s.Artifacts.Put(attemptCtx, name, data)
-		return err
-	}
-	if err := addJSON(filepath.Join(prefix, "source.json"), map[string]any{"repository_url": run.RepositoryURL, "requested_ref": run.RequestedRef, "resolved_ref": acquired.ResolvedRef, "ref_type": acquired.RefType, "commit_oid": acquired.CommitOID, "requested_path": run.RequestedPath}); err != nil {
+	artifacts := newAttemptArtifacts(attemptCtx, s.Artifacts, runID, run.AttemptNo)
+	if err := artifacts.putJSON("source.json", map[string]any{"repository_url": run.RepositoryURL, "requested_ref": run.RequestedRef, "resolved_ref": acquired.ResolvedRef, "ref_type": acquired.RefType, "commit_oid": acquired.CommitOID, "requested_path": run.RequestedPath}); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	if err := addJSON(filepath.Join(prefix, "validation-plan.json"), plan.Plan); err != nil {
+	if err := artifacts.putJSON("validation-plan.json", plan.Plan); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	if err := addJSON(filepath.Join(prefix, "diagnostics.json"), output.Diagnostics); err != nil {
+	if err := artifacts.putJSON("diagnostics.json", output.Diagnostics); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	if err := addJSON(filepath.Join(prefix, "tool-executions.json"), output.Executions); err != nil {
+	if err := artifacts.putJSON("tool-executions.json", output.Executions); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
 	if len(output.Dependencies) > 0 {
-		if err := addJSON(filepath.Join(prefix, "terraform-dependencies.json"), output.Dependencies); err != nil {
+		if err := artifacts.putJSON("terraform-dependencies.json", output.Dependencies); err != nil {
 			return fail("PERSISTENCE_ERROR", err)
 		}
 	}
-	if err := addJSON(filepath.Join(prefix, "discovery.json"), map[string]any{"terraform_targets": plan.TerraformTargets, "kubernetes_resources": plan.KubernetesResources, "skipped": plan.Skipped}); err != nil {
+	if err := artifacts.putJSON("discovery.json", map[string]any{"terraform_targets": plan.TerraformTargets, "kubernetes_resources": plan.KubernetesResources, "skipped": plan.Skipped}); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
 	if _, err = s.Repository.UpdatePhase(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, domain.StateValidating, domain.StateReviewing); err != nil {
@@ -210,73 +195,38 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		if item.EvidenceType == domain.EvidenceSource {
 			sourceExcerpts = append(sourceExcerpts, item)
 		}
-		if err := addJSON(filepath.Join(prefix, "evidence", item.EvidenceID+".json"), item); err != nil {
+		if err := artifacts.putJSON("evidence/"+item.EvidenceID+".json", item); err != nil {
 			return fail("PERSISTENCE_ERROR", err)
 		}
 	}
-	if err := addJSON(filepath.Join(prefix, "source-excerpts.json"), sourceExcerpts); err != nil {
+	if err := artifacts.putJSON("source-excerpts.json", sourceExcerpts); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
 	contextInput := evidence.BuildContext(output.Diagnostics, evidenceItems, s.Config.Limits.MaxAgentContextBytes)
-	reviewerOutput, reviewerErr := s.Reviewer.Review(attemptCtx, review.Input{Context: contextInput})
-	reviewStatus := domain.ReviewCompleted
-	evaluationStatus := domain.EvaluationNotApplicable
-	if reviewerErr != nil {
-		reviewStatus = domain.ReviewUnavailable
-	} else {
-		if err := addJSON(filepath.Join(prefix, "review-input.json"), contextInput); err != nil {
-			return fail("PERSISTENCE_ERROR", err)
-		}
-		if err := addJSON(filepath.Join(prefix, "reviewer.json"), reviewerOutput); err != nil {
-			return fail("PERSISTENCE_ERROR", err)
-		}
+	reviewed, err := s.reviewAttempt(attemptCtx, artifacts, review.Input{Context: contextInput})
+	if err != nil {
+		return fail("PERSISTENCE_ERROR", err)
 	}
 	if _, err = s.Repository.UpdatePhase(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, domain.StateReviewing, domain.StateEvaluating); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	evaluationOutput := (*domain.EvaluationOutput)(nil)
-	if reviewerErr == nil {
-		findings := make([]domain.Finding, 0, len(reviewerOutput.Findings))
-		for _, item := range reviewerOutput.Findings {
-			findings = append(findings, item.Finding)
-		}
-		valid, structural := (evaluation.DeterministicEvaluator{}).Validate(findings, evidenceItems, runID, run.AttemptNo, acquired.CommitOID)
-		semantic, semanticErr := s.Evaluator.Evaluate(attemptCtx, evaluation.Input{Findings: valid, Evidence: evidenceItems})
-		if semanticErr != nil {
-			evaluationStatus = domain.EvaluationUnavailable
-			for _, item := range valid {
-				structural.Items = append(structural.Items, domain.EvaluationItem{FindingID: item.FindingID, Verdict: domain.VerdictNotEvaluated, Reason: "semantic evaluator unavailable", EvidenceIDs: item.EvidenceIDs})
-			}
-			evaluationOutput = &structural
-		} else {
-			evaluationStatus = domain.EvaluationCompleted
-			structural.Items = append(structural.Items, semantic.Items...)
-			evaluationOutput = &structural
-		}
-		if err := addJSON(filepath.Join(prefix, "evaluation-input.json"), evaluation.Input{Findings: valid, Evidence: evidenceItems}); err != nil {
-			return fail("PERSISTENCE_ERROR", err)
-		}
-		if err := addJSON(filepath.Join(prefix, "evaluation.json"), evaluationOutput); err != nil {
-			return fail("PERSISTENCE_ERROR", err)
-		}
+	evaluationOutput, evaluationStatus, err := s.evaluateAttempt(attemptCtx, artifacts, reviewed.findings, evidenceItems, runID, run.AttemptNo, acquired.CommitOID)
+	if err != nil {
+		return fail("PERSISTENCE_ERROR", err)
 	}
 	if _, err = s.Repository.UpdatePhase(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, domain.StateEvaluating, domain.StatePersisting); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	reportBytes := report.RenderReport(run, acquired.CommitOID, outcome, coverage, output.Results, output.Diagnostics, optionalReview(reviewerErr, reviewerOutput), evaluationOutput)
-	reportPath := filepath.ToSlash(filepath.Join(prefix, "report.md"))
-	artifacts[reportPath] = reportBytes
-	if _, err = s.Artifacts.Put(attemptCtx, reportPath, reportBytes); err != nil {
+	reportBytes := report.RenderReport(run, acquired.CommitOID, outcome, coverage, output.Results, output.Diagnostics, reviewed.output, evaluationOutput)
+	if err = artifacts.put("report.md", reportBytes); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
 	manifest := report.Manifest{SchemaVersion: 1, PlatformLensVersion: s.Config.Version, ValidationPlanSchemaVersion: 1, Run: run, Source: map[string]any{"repository_url": run.RepositoryURL, "requested_ref": run.RequestedRef, "resolved_ref": acquired.ResolvedRef, "ref_type": acquired.RefType, "commit_oid": acquired.CommitOID}, Result: map[string]any{"analysis_outcome": outcome, "coverage_status": coverage}, Toolchain: map[string]any{"go_build_version": s.Toolchain.Lock.Go.Version, "expected_actual": s.Toolchain.Report(), "toolchain_lock_hash": s.Toolchain.Hash}, Config: map[string]any{"redaction_rules_version": evidence.RedactionRulesVersion, "context_builder_version": "1"}, Dependencies: map[string]any{"terraform_dependencies": output.Dependencies, "kubernetes_version": s.Toolchain.Lock.Kubeconform.KubernetesVersion, "schema_repository": s.Toolchain.Lock.Kubeconform.SchemaRepository, "schema_repository_commit": s.Toolchain.Lock.Kubeconform.SchemaRepositoryCommit}, AI: map[string]any{"reviewer": "DeterministicFakeReviewer", "evaluator": "DeterministicFakeEvaluator"}, Timestamps: map[string]string{"created_at": run.CreatedAt.UTC().Format(time.RFC3339Nano), "updated_at": s.Clock.Now().UTC().Format(time.RFC3339Nano)}}
-	manifestBytes, err := report.BuildManifest(manifest, relativeArtifacts(prefix, artifacts))
+	manifestBytes, err := report.BuildManifest(manifest, artifacts.relative())
 	if err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
-	manifestPath := filepath.ToSlash(filepath.Join(prefix, "manifest.json"))
-	artifacts[manifestPath] = manifestBytes
-	manifestURI, err := s.Artifacts.Put(attemptCtx, manifestPath, manifestBytes)
+	manifestURI, err := s.Artifacts.Put(attemptCtx, artifacts.path("manifest.json"), manifestBytes)
 	if err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
@@ -288,7 +238,7 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 		return fail("PERSISTENCE_ERROR", errors.New("manifest read-back bytes differ from authoritative write"))
 	}
 	manifestHash := report.Hash(readBack)
-	final, err := s.Repository.CompleteRun(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, outcome, coverage, reviewStatus, evaluationStatus, manifestURI, manifestHash)
+	final, err := s.Repository.CompleteRun(attemptCtx, runID, run.AttemptNo, s.Config.WorkerID, outcome, coverage, reviewed.status, evaluationStatus, manifestURI, manifestHash)
 	if err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
@@ -313,7 +263,9 @@ func (s *Service) ProcessQueuedAndReclaim(ctx context.Context, limit int) error 
 		if claimErr != nil {
 			return claimErr
 		}
-		_, _ = s.Process(ctx, claimed.RunID)
+		if _, processErr := s.Process(ctx, claimed.RunID); processErr != nil {
+			s.logRunError("run processing failed", claimed, processErr)
+		}
 	}
 	_, err = s.RecoverExpired(ctx, limit)
 	return err
@@ -343,11 +295,29 @@ func (s *Service) RecoverExpired(ctx context.Context, limit int) ([]domain.Analy
 		}
 		processed, processErr := s.Process(ctx, reclaimed.RunID)
 		if processErr != nil {
+			s.logRunError("reclaimed run processing failed", reclaimed, processErr)
 			return completed, processErr
 		}
 		completed = append(completed, processed)
 	}
 	return completed, nil
+}
+
+func (s *Service) logRunError(message string, run domain.AnalysisRun, err error) {
+	if s.Logger == nil {
+		return
+	}
+	attrs := []any{
+		"run_id", run.RunID,
+		"attempt_no", run.AttemptNo,
+		"worker_id", s.Config.WorkerID,
+		"state", run.State,
+		"error", err,
+	}
+	if run.CommitOID != "" {
+		attrs = append(attrs, "commit_oid", run.CommitOID)
+	}
+	s.Logger.Error(message, attrs...)
 }
 
 func (s *Service) WorkerLoop(ctx context.Context) {
@@ -369,76 +339,6 @@ func (s *Service) WorkerLoop(ctx context.Context) {
 		case <-ticker.C:
 		}
 	}
-}
-
-func (s *Service) startHeartbeat(ctx context.Context, cancel context.CancelFunc, run domain.AnalysisRun) func() {
-	heartbeatCtx, stop := context.WithCancel(ctx)
-	var mu sync.Mutex
-	expected := *run.LeaseExpiresAt
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(time.Duration(s.Config.HeartbeatSeconds) * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-heartbeatCtx.Done():
-				return
-			case <-ticker.C:
-				mu.Lock()
-				current := expected
-				mu.Unlock()
-				next := current.Add(time.Duration(s.Config.HeartbeatSeconds*2) * time.Second)
-				updated, err := s.Repository.RenewLease(heartbeatCtx, run.RunID, run.AttemptNo, s.Config.WorkerID, current, next)
-				if err != nil {
-					if errors.Is(err, runs.ErrConditional) || errors.Is(err, runs.ErrFencingLost) || !cloudaws.IsRetryable(err) {
-						cancel()
-						return
-					}
-					maxAttempts := s.Config.AWSMaxAttempts
-					if maxAttempts < 2 {
-						maxAttempts = 2
-					}
-					for retryAttempt := 2; retryAttempt <= maxAttempts; retryAttempt++ {
-						if !s.Clock.Now().Before(current.Add(-time.Duration(maxInt(1, s.Config.HeartbeatSeconds)) * time.Second)) {
-							break
-						}
-						delay := time.NewTimer(time.Duration(retryAttempt-1) * 50 * time.Millisecond)
-						select {
-						case <-heartbeatCtx.Done():
-							delay.Stop()
-							return
-						case <-delay.C:
-						}
-						updated, err = s.Repository.RenewLease(heartbeatCtx, run.RunID, run.AttemptNo, s.Config.WorkerID, current, next)
-						if err == nil {
-							break
-						}
-						if errors.Is(err, runs.ErrConditional) || errors.Is(err, runs.ErrFencingLost) || !cloudaws.IsRetryable(err) {
-							break
-						}
-					}
-					if err != nil {
-						cancel()
-						return
-					}
-				}
-				if updated.LeaseExpiresAt != nil {
-					mu.Lock()
-					expected = *updated.LeaseExpiresAt
-					mu.Unlock()
-				}
-			}
-		}
-	}()
-	return func() { stop(); <-done }
-}
-
-func maxInt(left, right int) int {
-	if left > right {
-		return left
-	}
-	return right
 }
 
 func Outcome(results []domain.ValidationResult, limits runtime.Limits) (domain.AnalysisOutcome, domain.CoverageStatus) {
@@ -470,17 +370,4 @@ func Outcome(results []domain.ValidationResult, limits runtime.Limits) (domain.A
 		return domain.OutcomeInconclusive, coverage
 	}
 	return domain.OutcomeNoFindings, coverage
-}
-func optionalReview(err error, output domain.ReviewOutput) *domain.ReviewOutput {
-	if err != nil {
-		return nil
-	}
-	return &output
-}
-func relativeArtifacts(prefix string, artifacts map[string][]byte) map[string][]byte {
-	result := map[string][]byte{}
-	for path, data := range artifacts {
-		result[path[len(prefix):]] = data
-	}
-	return result
 }

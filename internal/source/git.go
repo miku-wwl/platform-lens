@@ -194,8 +194,23 @@ type AcquiredSource struct {
 	CachePath   string
 }
 
-func (r *Runtime) Acquire(ctx context.Context, repositoryURL, requestedRef string) (AcquiredSource, error) {
+type refCandidate struct {
+	name string
+	kind domain.RefType
+}
+
+func (r *Runtime) sourceCachePath(repositoryURL string) (string, string, error) {
 	canonical, err := CanonicalURL(repositoryURL, r.Config.AllowLocalGit)
+	if err != nil {
+		return "", "", err
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	cache := filepath.Join(r.Config.SourceCacheDir, hex.EncodeToString(sum[:])[:32])
+	return canonical, cache, nil
+}
+
+func (r *Runtime) Acquire(ctx context.Context, repositoryURL, requestedRef string) (AcquiredSource, error) {
+	canonical, cache, err := r.sourceCachePath(repositoryURL)
 	if err != nil {
 		return AcquiredSource{}, err
 	}
@@ -203,8 +218,6 @@ func (r *Runtime) Acquire(ctx context.Context, repositoryURL, requestedRef strin
 	if err != nil {
 		return AcquiredSource{}, err
 	}
-	sum := sha256.Sum256([]byte(canonical))
-	cache := filepath.Join(r.Config.SourceCacheDir, hex.EncodeToString(sum[:])[:32])
 	lock, err := AcquireFileLock(cache+".lock", time.Minute)
 	if err != nil {
 		return AcquiredSource{}, err
@@ -226,15 +239,13 @@ func (r *Runtime) Acquire(ctx context.Context, repositoryURL, requestedRef strin
 // AcquirePinned materializes an already recorded commit without consulting the
 // requested branch or tag again. This is the recovery/replay path.
 func (r *Runtime) AcquirePinned(ctx context.Context, repositoryURL, commitOID, resolved string, refType domain.RefType) (AcquiredSource, error) {
-	canonical, err := CanonicalURL(repositoryURL, r.Config.AllowLocalGit)
+	canonical, cache, err := r.sourceCachePath(repositoryURL)
 	if err != nil {
 		return AcquiredSource{}, err
 	}
 	if !fullOID.MatchString(commitOID) {
 		return AcquiredSource{}, ErrShortOID
 	}
-	sum := sha256.Sum256([]byte(canonical))
-	cache := filepath.Join(r.Config.SourceCacheDir, hex.EncodeToString(sum[:])[:32])
 	lock, err := AcquireFileLock(cache+".lock", time.Minute)
 	if err != nil {
 		return AcquiredSource{}, err
@@ -348,33 +359,8 @@ func (r *Runtime) resolve(ctx context.Context, cache, ref string) (string, strin
 		}
 		return r.verify(ctx, cache, oid, remoteHead, domain.RefHead)
 	}
-	refs := []struct {
-		name string
-		kind domain.RefType
-	}{}
-	if strings.HasPrefix(ref, "refs/heads/") {
-		refs = append(refs, struct {
-			name string
-			kind domain.RefType
-		}{ref, domain.RefBranch})
-	} else if strings.HasPrefix(ref, "refs/tags/") {
-		refs = append(refs, struct {
-			name string
-			kind domain.RefType
-		}{ref, domain.RefTag})
-	} else {
-		refs = append(refs, struct {
-			name string
-			kind domain.RefType
-		}{"refs/heads/" + ref, domain.RefBranch}, struct {
-			name string
-			kind domain.RefType
-		}{"refs/tags/" + ref, domain.RefTag})
-	}
-	existing := make([]struct {
-		name string
-		kind domain.RefType
-	}, 0, 2)
+	refs := refCandidates(ref)
+	existing := make([]refCandidate, 0, len(refs))
 	for _, candidate := range refs {
 		result := r.git(ctx, cache, "show-ref", "--verify", "--quiet", candidate.name)
 		if result.ExitCode != nil && *result.ExitCode == 0 {
@@ -392,6 +378,19 @@ func (r *Runtime) resolve(ctx context.Context, cache, ref string) (string, strin
 		return "", "", "", err
 	}
 	return r.verify(ctx, cache, oid, existing[0].name, existing[0].kind)
+}
+
+func refCandidates(ref string) []refCandidate {
+	if strings.HasPrefix(ref, "refs/heads/") {
+		return []refCandidate{{name: ref, kind: domain.RefBranch}}
+	}
+	if strings.HasPrefix(ref, "refs/tags/") {
+		return []refCandidate{{name: ref, kind: domain.RefTag}}
+	}
+	return []refCandidate{
+		{name: "refs/heads/" + ref, kind: domain.RefBranch},
+		{name: "refs/tags/" + ref, kind: domain.RefTag},
+	}
 }
 
 func (r *Runtime) remoteHead(ctx context.Context, cache string) (string, error) {

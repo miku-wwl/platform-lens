@@ -2,12 +2,14 @@ package app
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/smithy-go"
 	"github.com/miku-wwl/platform-lens/internal/domain"
+	"github.com/miku-wwl/platform-lens/internal/runs"
 	"github.com/miku-wwl/platform-lens/internal/runtime"
 )
 
@@ -112,5 +114,25 @@ func TestHeartbeatStopsAfterBoundedTransientRetries(t *testing.T) {
 	}
 	if calls := repository.calls.Load(); calls != 3 {
 		t.Fatalf("heartbeat calls=%d, want exactly configured max attempts 3", calls)
+	}
+}
+
+func TestRetryableLeaseErrorKeepsFencingFailuresNonRetryable(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "conditional", err: runs.ErrConditional, want: false},
+		{name: "fencing", err: runs.ErrFencingLost, want: false},
+		{name: "transient cloud", err: &smithy.GenericAPIError{Code: "ThrottlingException"}, want: true},
+		{name: "unknown", err: errors.New("not retryable"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := retryableLeaseError(tt.err); got != tt.want {
+				t.Fatalf("retryableLeaseError()=%v, want %v", got, tt.want)
+			}
+		})
 	}
 }

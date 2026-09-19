@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -305,8 +306,8 @@ func truncate(value string, max int) string {
 }
 func ensureParent(path string) error {
 	parent := filepath.Dir(path)
-	if parent == "." {
+	if parent == "." || parent == "" {
 		return nil
 	}
-	return nil
+	return os.MkdirAll(parent, 0o700)
 }
