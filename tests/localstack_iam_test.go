@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/miku-wwl/platform-lens/internal/cloudaws"
 	"github.com/miku-wwl/platform-lens/internal/runtime"
@@ -26,9 +28,18 @@ func TestLocalStackIAMWorkerPolicyAndNegativeChecks(t *testing.T) {
 	if accessKey == "" || secretKey == "" {
 		t.Skip("BLOCKED: Terraform worker access-key environment is missing")
 	}
+	t.Setenv("AWS_ACCESS_KEY_ID", "test")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	t.Setenv("AWS_REGION", "us-east-1")
+	adminConfig, err := cloudaws.Load(context.Background(), cloudaws.Options{Region: "us-east-1", Endpoint: endpoint, MaxAttempts: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminDynamo := dynamodb.NewFromConfig(adminConfig.AWS)
+	adminS3 := s3.NewFromConfig(adminConfig.AWS, func(options *s3.Options) { options.UsePathStyle = true })
+	adminIAM := iam.NewFromConfig(adminConfig.AWS)
 	t.Setenv("AWS_ACCESS_KEY_ID", accessKey)
 	t.Setenv("AWS_SECRET_ACCESS_KEY", secretKey)
-	t.Setenv("AWS_REGION", "us-east-1")
 	config, err := cloudaws.Load(context.Background(), cloudaws.Options{Region: "us-east-1", Endpoint: endpoint, MaxAttempts: 3})
 	if err != nil {
 		t.Fatal(err)
@@ -63,5 +74,53 @@ func TestLocalStackIAMWorkerPolicyAndNegativeChecks(t *testing.T) {
 		t.Fatalf("worker unexpectedly created forbidden bucket %q", deniedBucket)
 	} else if !cloudaws.IsAccessDenied(err) {
 		t.Fatalf("forbidden CreateBucket returned non-access error: %v", err)
+	}
+
+	deleteTable := "platformlens-iam-delete-denied-" + runtime.NewID()[:8]
+	if _, err := adminDynamo.CreateTable(context.Background(), &dynamodb.CreateTableInput{
+		TableName:            aws.String(deleteTable),
+		BillingMode:          types.BillingModePayPerRequest,
+		AttributeDefinitions: []types.AttributeDefinition{{AttributeName: aws.String("run_id"), AttributeType: types.ScalarAttributeTypeS}},
+		KeySchema:            []types.KeySchemaElement{{AttributeName: aws.String("run_id"), KeyType: types.KeyTypeHash}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = adminDynamo.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(deleteTable)})
+	}()
+	if err := dynamodb.NewTableExistsWaiter(adminDynamo).Wait(context.Background(), &dynamodb.DescribeTableInput{TableName: aws.String(deleteTable)}, 30*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dynamoClient.DeleteTable(context.Background(), &dynamodb.DeleteTableInput{TableName: aws.String(deleteTable)}); err == nil {
+		t.Fatalf("worker unexpectedly deleted forbidden table %q", deleteTable)
+	} else if !cloudaws.IsAccessDenied(err) {
+		t.Fatalf("forbidden DeleteTable returned non-access error: %v", err)
+	}
+
+	deleteBucket := "platformlens-iam-delete-denied-" + runtime.NewID()[:8]
+	if _, err := adminS3.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: aws.String(deleteBucket)}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = adminS3.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(deleteBucket)})
+	}()
+	if _, err := s3Client.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(deleteBucket)}); err == nil {
+		t.Fatalf("worker unexpectedly deleted forbidden bucket %q", deleteBucket)
+	} else if !cloudaws.IsAccessDenied(err) {
+		t.Fatalf("forbidden DeleteBucket returned non-access error: %v", err)
+	}
+
+	adminUser := "platformlens-iam-admin-denied-" + runtime.NewID()[:8]
+	if _, err := adminIAM.CreateUser(context.Background(), &iam.CreateUserInput{UserName: aws.String(adminUser)}); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = adminIAM.DeleteUser(context.Background(), &iam.DeleteUserInput{UserName: aws.String(adminUser)})
+	}()
+	workerIAM := iam.NewFromConfig(config.AWS)
+	if _, err := workerIAM.DeleteUser(context.Background(), &iam.DeleteUserInput{UserName: aws.String(adminUser)}); err == nil {
+		t.Fatalf("worker unexpectedly performed forbidden IAM administration for %q", adminUser)
+	} else if !cloudaws.IsAccessDenied(err) {
+		t.Fatalf("forbidden IAM DeleteUser returned non-access error: %v", err)
 	}
 }

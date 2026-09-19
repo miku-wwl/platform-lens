@@ -24,8 +24,13 @@ func TestLocalStackDynamoS3E2E(t *testing.T) {
 	if endpoint == "" {
 		t.Skip("set PLATFORMLENS_LOCALSTACK_ENDPOINT to run LocalStack E2E")
 	}
-	t.Setenv("AWS_ACCESS_KEY_ID", "test")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	accessKey := os.Getenv("PLATFORMLENS_LOCALSTACK_WORKER_ACCESS_KEY_ID")
+	secretKey := os.Getenv("PLATFORMLENS_LOCALSTACK_WORKER_SECRET_ACCESS_KEY")
+	if accessKey == "" || secretKey == "" {
+		accessKey, secretKey = "test", "test"
+	}
+	t.Setenv("AWS_ACCESS_KEY_ID", accessKey)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", secretKey)
 	t.Setenv("AWS_REGION", "us-east-1")
 	fixture := t.TempDir()
 	git(t, fixture, "init", "-b", "main")

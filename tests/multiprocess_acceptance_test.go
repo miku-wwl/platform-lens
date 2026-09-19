@@ -67,6 +67,12 @@ func TestLocalStackMultiProcessAndProcessKillAcceptance(t *testing.T) {
 	runIDs := make([]string, 0, 20)
 	for i := 0; i < 20; i++ {
 		runIDs = append(runIDs, submitAcceptanceRun(t, client, "http://127.0.0.1:18182", fixture))
+		if len(runIDs)%4 == 0 {
+			wave := runIDs[len(runIDs)-4:]
+			for _, runID := range wave {
+				_ = waitForTerminalRun(t, client, "http://127.0.0.1:18181", runID, 60*time.Second)
+			}
+		}
 	}
 	completed, failed, reclaims := 0, 0, 0
 	for _, runID := range runIDs {
@@ -87,6 +93,12 @@ func TestLocalStackMultiProcessAndProcessKillAcceptance(t *testing.T) {
 		}
 	}
 	if completed != 20 || failed != 0 {
+		for _, runID := range runIDs {
+			result, err := getAcceptanceRun(t, client, "http://127.0.0.1:18181", runID)
+			if err == nil && result.State == domain.StateFailed {
+				t.Logf("failed batch run %s: code=%s message=%s", runID, result.FailureCode, result.FailureMessage)
+			}
+		}
 		t.Fatalf("multi-process batch completed=%d failed=%d reclaims=%d", completed, failed, reclaims)
 	}
 	t.Logf("multi-process batch: workers=2 submitted=%d completed=%d failed=%d reclaims=%d duplicate_authority_violations=0", len(runIDs), completed, failed, reclaims)
@@ -149,6 +161,10 @@ func stopAcceptanceWorker(worker *acceptanceWorker) {
 }
 
 func acceptanceEnvironment(endpoint, workerID, dataDir string, port int) []string {
+	accessKey, secretKey := os.Getenv("PLATFORMLENS_LOCALSTACK_WORKER_ACCESS_KEY_ID"), os.Getenv("PLATFORMLENS_LOCALSTACK_WORKER_SECRET_ACCESS_KEY")
+	if accessKey == "" || secretKey == "" {
+		accessKey, secretKey = "test", "test"
+	}
 	values := map[string]string{
 		"PLATFORMLENS_BACKEND":                       "aws",
 		"PLATFORMLENS_AWS_MAX_ATTEMPTS":              "3",
@@ -156,8 +172,8 @@ func acceptanceEnvironment(endpoint, workerID, dataDir string, port int) []strin
 		"PLATFORMLENS_AWS_ENDPOINT_URL":              endpoint,
 		"AWS_ENDPOINT_URL":                           endpoint,
 		"AWS_REGION":                                 "us-east-1",
-		"AWS_ACCESS_KEY_ID":                          "test",
-		"AWS_SECRET_ACCESS_KEY":                      "test",
+		"AWS_ACCESS_KEY_ID":                          accessKey,
+		"AWS_SECRET_ACCESS_KEY":                      secretKey,
 		"PLATFORMLENS_DYNAMODB_TABLE":                "platformlens-runs",
 		"PLATFORMLENS_S3_BUCKET":                     "platformlens-artifacts",
 		"PLATFORMLENS_WORKER_ID":                     workerID,
