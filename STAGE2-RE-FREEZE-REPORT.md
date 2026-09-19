@@ -153,3 +153,18 @@ The comparison report records the concepts that were intentionally rejected.
 
 Only the already-defined Stage 2.5 Web Console work and Stage 3 thin real-AWS
 validation remain. Stage 2 does not introduce either scope.
+
+## Documentation Closeout
+
+- README roadmap corrected to the frozen v0.8.7 sequence: Stage 1 LocalStack,
+  Stage 2 reference-driven polish, Stage 2.5 Web Console, and Stage 3 thin
+  real-AWS validation.
+- LocalStack startup documentation now selects `PLATFORMLENS_BACKEND=aws`,
+  sets `AWS_ENDPOINT_URL`, uses the provisioned worker credentials, and states
+  that runtime does not implicitly provision DynamoDB/S3.
+- Local Git fixture documentation now requires the explicit
+  `PLATFORMLENS_ALLOW_LOCAL_GIT=true` TEST/DEV opt-in and uses the accepted
+  `analyze --ref REF REPOSITORY_URL` CLI form.
+- Documentation-only regression after this closeout: `go vet ./...` and
+  `go test ./...` PASS; no production code or frozen v0.8.7 design document
+  changed.
