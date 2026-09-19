@@ -5,3 +5,10 @@
 *.exe
 *.test
 coverage.out
+web/node_modules/
+web/dist/
+web/coverage/
+web/playwright-report/
+web/test-results/
+.platformlens-ui-e2e/
+fixtures/web-console-demo/

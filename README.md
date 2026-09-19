@@ -41,12 +41,16 @@ go build -o .platformlens/platformlens.exe ./cmd/platformlens
 ```powershell
 go run ./cmd/platformlens toolchain
 $env:PLATFORMLENS_ALLOW_LOCAL_GIT = "true" # TEST/DEV fixture use only
+$env:PLATFORMLENS_DATA_DIR = (Join-Path (Get-Location) ".platformlens")
+$env:PLATFORMLENS_WORKSPACE_DIR = (Join-Path $env:PLATFORMLENS_DATA_DIR "workspaces")
+$env:PLATFORMLENS_SOURCE_CACHE_DIR = (Join-Path $env:PLATFORMLENS_DATA_DIR "source-cache")
+$env:PLATFORMLENS_ARTIFACT_DIR = (Join-Path $env:PLATFORMLENS_DATA_DIR "artifacts")
 go run ./cmd/platformlens analyze --ref main C:\path\to\fixture-repository
 go run ./cmd/platformlens get RUN_ID
 go run ./cmd/platformlens serve
 ```
 
-The HTTP API listens on `127.0.0.1:8000` by default. `POST /analysis` accepts `{ "repository_url": "https://...", "requested_ref": "main", "requested_path": "" }`; production/default source handling accepts HTTPS repositories only. A local absolute path is accepted only when `PLATFORMLENS_ALLOW_LOCAL_GIT=true`, which is a TEST/DEV fixture opt-in. `GET /analysis/{run_id}` returns the fenced run state.
+The absolute directory settings above are required for the local Git fixture workflow because Git worktrees are materialized from the source cache. The HTTP API listens on `127.0.0.1:8000` by default. `POST /analysis` accepts `{ "repository_url": "https://...", "requested_ref": "main", "requested_path": "" }`; production/default source handling accepts HTTPS repositories only. A local absolute path is accepted only when `PLATFORMLENS_ALLOW_LOCAL_GIT=true`, which is a TEST/DEV fixture opt-in. `GET /analysis/{run_id}` returns the fenced run state.
 
 ## LocalStack Ultimate mode
 
@@ -64,6 +68,36 @@ go run ./cmd/platformlens serve
 ```
 
 The Go DynamoDB/S3 implementations are shared by the LocalStack Stage 1 gate and the thin real-AWS Stage 3 validation; only AWS configuration and endpoint selection change. The E2E gate uses deterministic fake reviewer/evaluator implementations and does not call a live model or real AWS.
+
+## Stage 2.5 Web Console / Operator UX
+
+The `web/` directory contains the Stage 2.5 React + TypeScript + Vite presentation layer. The browser talks only to the Go HTTP API; it does not access DynamoDB, S3, LocalStack, SQLite, filesystem paths, or AWS credentials directly.
+
+Requirements: Node.js and npm. Start the backend in one terminal, then start the Vite console in another:
+
+```powershell
+# Terminal 1: SQLite/filesystem backend
+go run ./cmd/platformlens serve
+
+# Terminal 2: Web Console
+Set-Location web
+npm ci
+npm run dev
+```
+
+Open `http://localhost:5173`. The Vite development proxy forwards `/analysis`, `/healthz`, `/readyz`, and `/version` to `http://127.0.0.1:8000`. For LocalStack, start the backend with the LocalStack environment shown above; the same console and proxy are used.
+
+Frontend gates:
+
+```powershell
+Set-Location web
+npm ci
+npm run typecheck
+npm test
+npm run build
+```
+
+The console provides Dashboard, New Analysis, Runs, and Run Detail surfaces. Run Detail polls active runs, renders the defined lifecycle with only the authoritative current state highlighted, and reads report/manifest/evidence through bounded backend endpoints. Local Git fixture analysis remains TEST/DEV-only and still requires `PLATFORMLENS_ALLOW_LOCAL_GIT=true` in the backend process.
 
 ## Artifact layout
 

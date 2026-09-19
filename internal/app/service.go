@@ -157,6 +157,9 @@ func (s *Service) Process(ctx context.Context, runID string) (domain.AnalysisRun
 	if err := artifacts.putJSON("validation-plan.json", plan.Plan); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}
+	if err := artifacts.putJSON("validation-results.json", output.Results); err != nil {
+		return fail("PERSISTENCE_ERROR", err)
+	}
 	if err := artifacts.putJSON("diagnostics.json", output.Diagnostics); err != nil {
 		return fail("PERSISTENCE_ERROR", err)
 	}

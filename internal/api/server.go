@@ -23,7 +23,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", s.ready)
 	mux.HandleFunc("GET /version", s.version)
 	mux.HandleFunc("POST /analysis", s.create)
-	mux.HandleFunc("GET /analysis/", s.get)
+	mux.HandleFunc("GET /analysis", s.listRuns)
+	mux.HandleFunc("GET /analysis/{run_id}/artifacts", s.listArtifacts)
+	mux.HandleFunc("GET /analysis/{run_id}/artifacts/{name...}", s.artifact)
+	mux.HandleFunc("GET /analysis/{run_id}/report", s.report)
+	mux.HandleFunc("GET /analysis/{run_id}/manifest", s.manifest)
+	mux.HandleFunc("GET /analysis/{run_id}", s.get)
 	return loggingMiddleware(mux)
 }
 
@@ -55,7 +60,7 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"run_id": run.RunID, "state": run.State})
 }
 func (s *Server) get(w http.ResponseWriter, r *http.Request) {
-	runID := strings.TrimPrefix(r.URL.Path, "/analysis/")
+	runID := r.PathValue("run_id")
 	if runID == "" {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
@@ -69,6 +74,9 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	// Preserve the existing single-run response contract, including active
+	// lease fields used by operational acceptance tooling. The bounded list
+	// endpoint uses the safer RunView DTO separately.
 	writeJSON(w, http.StatusOK, run)
 }
 func writeJSON(w http.ResponseWriter, status int, value any) {

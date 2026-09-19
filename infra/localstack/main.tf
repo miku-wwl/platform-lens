@@ -76,6 +76,7 @@ resource "aws_iam_policy" "worker" {
           "dynamodb:PutItem",
           "dynamodb:UpdateItem",
           "dynamodb:Query",
+          "dynamodb:Scan",
         ]
         Resource = [
           aws_dynamodb_table.runs.arn,
